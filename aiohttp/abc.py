@@ -10,7 +10,7 @@ from multidict import CIMultiDict
 from yarl import URL
 
 from ._cookie_helpers import parse_set_cookie_headers
-from .typedefs import LooseCookies
+from .typedefs import LooseCookies, StrOrURL
 
 if TYPE_CHECKING:
     from .web_app import Application
@@ -183,18 +183,31 @@ class AbstractCookieJar(Sized, Iterable[Morsel[str]]):
         """Clear all cookies for domain and all subdomains."""
 
     @abstractmethod
-    def update_cookies(self, cookies: LooseCookies, response_url: URL = URL()) -> None:
-        """Update cookies."""
+    def update_cookies(
+        self,
+        cookies: LooseCookies,
+        response_url: URL = URL(),
+        partition_key: StrOrURL | None = None,
+    ) -> None:
+        """Update cookies, optionally scoped to a partition."""
 
     def update_cookies_from_headers(
-        self, headers: Sequence[str], response_url: URL
+        self,
+        headers: Sequence[str],
+        response_url: URL,
+        partition_key: StrOrURL | None = None,
     ) -> None:
         """Update cookies from raw Set-Cookie headers."""
         if headers and (cookies_to_update := parse_set_cookie_headers(headers)):
-            self.update_cookies(cookies_to_update, response_url)
+            if partition_key is None:
+                self.update_cookies(cookies_to_update, response_url)
+            else:
+                self.update_cookies(cookies_to_update, response_url, partition_key)
 
     @abstractmethod
-    def filter_cookies(self, request_url: URL) -> BaseCookie[str]:
+    def filter_cookies(
+        self, request_url: URL, partition_key: StrOrURL | None = None
+    ) -> BaseCookie[str]:
         """Return the jar's cookies filtered by their attributes."""
 
 

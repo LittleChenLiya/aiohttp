@@ -1,0 +1,8 @@
+Add :class:`aiohttp.PartitionedCookieJar` and a ``partition_key`` parameter
+to client requests (``ClientSession.request(..., partition_key=...)``) for
+isolating cookies per caller-provided absolute HTTP(S) origin. Partition keys
+are normalized to scheme, IDNA host and effective port; redirects reuse the
+original request's partition. The partitioned jar persists a versioned JSON
+file and refuses to load corrupted or unsupported versions without dropping
+the current state.
+-- by :user:`DreamsPoet`

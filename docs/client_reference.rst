@@ -953,6 +953,14 @@ certification chaining.
 
    :param dict cookies: HTTP Cookies to send with the request (optional)
 
+   :param partition_key: Absolute HTTP(S) origin (:class:`str` or
+      :class:`~yarl.URL`) naming the cookie partition used for this request
+      and the responses/redirects it produces. Requires a
+      :class:`PartitionedCookieJar`; ignored partitions behave like a plain
+      :class:`CookieJar` when omitted.
+
+      .. versionadded:: 4.0
+
    :param dict headers: HTTP Headers to send with the request (optional)
 
    :param skip_auto_headers: set of headers for which autogeneration
@@ -2568,6 +2576,61 @@ Utilities
          The tuples gained the *path* element; host-only state is tracked
          per ``(domain, path, name)`` cookie identity so that same-named
          cookies on other paths cannot affect it.
+
+
+.. class:: PartitionedCookieJar(*, unsafe=False, quote_cookie=True, treat_as_secure_origin=[])
+   :canonical: aiohttp.cookiejar.PartitionedCookieJar
+
+   A :class:`CookieJar` that keeps cookies isolated in caller-named
+   partitions. This is **not** a browser CHIPS implementation: there is no
+   public-suffix list, and partitions are not derived automatically.
+   Instead, the caller passes an absolute HTTP(S) origin (such as
+   ``"https://embedded.example:8443"``) as ``partition_key`` to
+   :meth:`ClientSession.request`, :meth:`update_cookies`,
+   :meth:`update_cookies_from_headers` and :meth:`filter_cookies`. The key
+   is normalized to its scheme, IDNA host and effective port, so
+   ``https://Example.com`` and ``https://example.com:443`` name the same
+   partition.
+
+   Different partitions may each contain a cookie with the same
+   ``(domain, path, name)`` identity; the usual domain, path, secure and
+   host-only rules still apply independently inside each partition.
+   Redirects keep using the original request's partition rather than
+   rebuilding one from the redirect target. Calls without a
+   ``partition_key`` share one default partition with plain
+   :class:`CookieJar` semantics.
+
+   Cookies are persisted by :meth:`save` into a versioned JSON envelope;
+   :meth:`load` raises :class:`ValueError` for corrupted files or
+   unsupported versions without replacing the current contents.
+
+      .. versionadded:: 4.0
+
+   .. method:: filter_cookies(request_url, partition_key=None)
+
+      Return cookies stored in ``partition_key`` that are acceptable for
+      ``request_url``.
+
+   .. method:: update_cookies(cookies, response_url=None, partition_key=None)
+
+      Store ``cookies`` (see :meth:`CookieJar.update_cookies`) in
+      ``partition_key``.
+
+   .. method:: clear(predicate=None, *, partition_key=None)
+
+      Remove cookies from every partition, or only from ``partition_key``
+      when it is provided.
+
+   .. attribute:: cookies
+
+      A read-only view keyed by ``(domain, path)`` tuples, where the
+      domain is prefixed with ``"<partition>\\x00"`` for non-default
+      partitions; the default partition uses plain ``(domain, path)`` keys.
+
+   .. attribute:: host_only_cookies
+
+      A :class:`frozenset` of ``(domain, path, name)`` tuples using the
+      same partition-prefixed domain encoding as :attr:`cookies`.
 
 
 .. class:: DummyCookieJar(*, loop=None)

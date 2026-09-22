@@ -22,7 +22,7 @@ from .abc import AbstractCookieJar, ClearCookiePredicate
 from .helpers import is_ip_address
 from .typedefs import LooseCookies, PathLike, StrOrURL
 
-__all__ = ("CookieJar", "DummyCookieJar")
+__all__ = ("CookieJar", "DummyCookieJar", "PartitionedCookieJar")
 
 
 CookieItem = Union[str, "Morsel[str]"]
@@ -39,6 +39,35 @@ _SIMPLE_COOKIE = SimpleCookie()
 
 # Not persisted; the absolute deadline is saved instead.
 _RELATIVE_EXPIRY_ATTRS = frozenset(("max-age", "expires"))
+
+
+def _normalize_partition_key(partition_key: StrOrURL) -> str:
+    """Normalize a caller-provided absolute HTTP(S) origin into a partition key.
+
+    The key is composed of the scheme, the IDNA host and the effective
+    (explicit or default) port, so that ``https://Example.com`` and
+    ``https://example.com:443`` map to the same partition. Paths, queries
+    and credentials are not part of a partition key.
+    """
+    url = partition_key if isinstance(partition_key, URL) else URL(partition_key)
+    if not url.absolute or url.scheme not in ("http", "https"):
+        raise ValueError(
+            "partition_key must be an absolute http(s) origin, "
+            f"got {partition_key!r}"
+        )
+    hostname = url.raw_host
+    if not hostname:
+        raise ValueError(f"partition_key has no host: {partition_key!r}")
+    origin = url.origin()
+    if url.raw_user or url.raw_password:
+        raise ValueError(
+            f"partition_key must not contain credentials: {partition_key!r}"
+        )
+    port = origin.explicit_port or (443 if origin.scheme == "https" else 80)
+    return f"{origin.scheme}://{origin.raw_host}:{port}"
+
+
+_PARTITIONED_JAR_FORMAT_VERSION = 1
 
 
 class CookieJar(AbstractCookieJar):
@@ -139,29 +168,20 @@ class CookieJar(AbstractCookieJar):
             :class:`str` or :class:`pathlib.Path` instance.
         """
         file_path = pathlib.Path(file_path)
-        data: dict[str, dict[str, dict[str, str | bool | float]]] = {}
-        for (domain, path), cookie in self._cookies.items():
-            key = f"{domain}|{path}"
-            data[key] = {}
-            for name, morsel in cookie.items():
-                morsel_data: dict[str, str | bool | float] = {
-                    "key": morsel.key,
-                    "value": morsel.value,
-                    "coded_value": morsel.coded_value,
-                }
-                # Skip relative expiry; the absolute deadline is saved below.
-                for attr in morsel._reserved:  # type: ignore[attr-defined]
-                    if attr in _RELATIVE_EXPIRY_ATTRS:
-                        continue
-                    attr_val = morsel[attr]
-                    if attr_val:
-                        morsel_data[attr] = attr_val
-                # Persist or it reloads as a domain cookie and leaks to subdomains.
-                if (domain, path, name) in self._host_only_cookies:
-                    morsel_data["host_only"] = True
-                if (exp := self._expirations.get((domain, path, name))) is not None:
-                    morsel_data["expires_timestamp"] = exp
-                data[key][name] = morsel_data
+        data: dict[str, dict[str, dict[str, str | bool | float]]] = {
+            f"{domain}|{path}": {
+                name: _serialize_morsel(
+                    morsel,
+                    domain,
+                    path,
+                    name,
+                    self._host_only_cookies,
+                    self._expirations,
+                )
+                for name, morsel in cookie.items()
+            }
+            for (domain, path), cookie in self._cookies.items()
+        }
 
         # Cookie persistence may include authentication/session tokens.
         # Use 0o600 at creation time to avoid umask-dependent overexposure
@@ -192,39 +212,22 @@ class CookieJar(AbstractCookieJar):
         self, data: dict[str, dict[str, dict[str, str | bool | float]]]
     ) -> None:
         """Replace contents, routing cookies through update_cookies()."""
-        self.clear()
-        for compound_key, cookie_data in data.items():
-            domain, path = compound_key.split("|", 1)
-            for name, morsel_data in cookie_data.items():
-                morsel: Morsel[str] = Morsel()
-                # Use __setstate__ to bypass validation, same pattern
-                # used in _build_morsel and _cookie_helpers.
-                morsel.__setstate__(  # type: ignore[attr-defined]
-                    {
-                        "key": morsel_data["key"],
-                        "value": morsel_data["value"],
-                        "coded_value": morsel_data["coded_value"],
-                    }
-                )
-                # Restore morsel attributes
-                for attr in morsel._reserved:  # type: ignore[attr-defined]
-                    if attr in morsel_data and attr not in (
-                        "key",
-                        "value",
-                        "coded_value",
-                    ):
-                        morsel[attr] = morsel_data[attr]
-                # Drop the domain so update_cookies() re-marks it host-only.
-                if morsel_data.get("host_only"):
-                    morsel["domain"] = ""
-                response_url = (
-                    URL.build(scheme="https", host=domain) if domain else URL()
-                )
-                self.update_cookies({name: morsel}, response_url)
-                # Restore the absolute deadline; update_cookies() schedules none.
-                if (exp := morsel_data.get("expires_timestamp")) is not None:
-                    self._expire_cookie(float(exp), domain, path, name)
-        self._do_expiration()
+        # Load into a fresh jar first so a malformed file cannot replace half
+        # of the existing state; adopt it only once the full file is parsed.
+        staging = CookieJar(
+            unsafe=self._unsafe,
+            quote_cookie=self._quote_cookie,
+            treat_as_secure_origin=tuple(self._treat_as_secure_origin),
+        )
+        _populate_jar_from_json(staging, data)
+        self._adopt_jar(staging)
+
+    def _adopt_jar(self, other: "CookieJar") -> None:
+        self._expire_heap = other._expire_heap
+        self._cookies = other._cookies
+        self._morsel_cache = other._morsel_cache
+        self._host_only_cookies = other._host_only_cookies
+        self._expirations = other._expirations
 
     def clear(self, predicate: ClearCookiePredicate | None = None) -> None:
         if predicate is None:
@@ -323,14 +326,32 @@ class CookieJar(AbstractCookieJar):
         heapq.heappush(self._expire_heap, (when, cookie_key))
         self._expirations[cookie_key] = when
 
-    def update_cookies(self, cookies: LooseCookies, response_url: URL = URL()) -> None:
+    def update_cookies(
+        self,
+        cookies: LooseCookies,
+        response_url: URL = URL(),
+        partition_key: StrOrURL | None = None,
+    ) -> None:
         """Update cookies."""
+        if partition_key is not None:
+            raise TypeError(
+                "partition_key is only supported by PartitionedCookieJar; "
+                "use aiohttp.PartitionedCookieJar as the session's cookie jar"
+            )
         self._update_cookies(cookies, response_url, copy_morsels=True)
 
     def update_cookies_from_headers(
-        self, headers: Sequence[str], response_url: URL
+        self,
+        headers: Sequence[str],
+        response_url: URL,
+        partition_key: StrOrURL | None = None,
     ) -> None:
         """Update cookies from raw Set-Cookie headers."""
+        if partition_key is not None:
+            raise TypeError(
+                "partition_key is only supported by PartitionedCookieJar; "
+                "use aiohttp.PartitionedCookieJar as the session's cookie jar"
+            )
         if headers and (cookies_to_update := parse_set_cookie_headers(headers)):
             # The freshly parsed Morsels are not shared with the caller,
             # so they can be stored and normalized without a defensive copy.
@@ -424,8 +445,15 @@ class CookieJar(AbstractCookieJar):
 
         self._do_expiration()
 
-    def filter_cookies(self, request_url: URL) -> "BaseCookie[str]":
+    def filter_cookies(
+        self, request_url: URL, partition_key: StrOrURL | None = None
+    ) -> "BaseCookie[str]":
         """Returns this jar's cookies filtered by their attributes."""
+        if partition_key is not None:
+            raise TypeError(
+                "partition_key is only supported by PartitionedCookieJar; "
+                "use aiohttp.PartitionedCookieJar as the session's cookie jar"
+            )
         if not isinstance(request_url, URL):
             warnings.warn(  # type: ignore[unreachable]
                 f"The method accepts yarl.URL instances only, got {type(request_url)}",
@@ -605,6 +633,309 @@ class CookieJar(AbstractCookieJar):
         return calendar.timegm((year, month, day, hour, minute, second, -1, -1, -1))
 
 
+def _populate_jar_from_json(
+    jar: "CookieJar",
+    data: dict[str, dict[str, dict[str, str | bool | float]]],
+) -> None:
+    """Populate an empty jar, routing cookies through update_cookies()."""
+    for compound_key, cookie_data in data.items():
+        if not isinstance(compound_key, str):
+            raise ValueError("invalid cookie jar entry")
+        domain, path = compound_key.split("|", 1)
+        for name, morsel_data in cookie_data.items():
+            if type(morsel_data) is not dict:
+                raise ValueError(f"invalid cookie data for {name!r}")
+            morsel: Morsel[str] = Morsel()
+            # Use __setstate__ to bypass validation, same pattern
+            # used in _build_morsel and _cookie_helpers.
+            morsel.__setstate__(  # type: ignore[attr-defined]
+                {
+                    "key": morsel_data["key"],
+                    "value": morsel_data["value"],
+                    "coded_value": morsel_data["coded_value"],
+                }
+            )
+            # Restore morsel attributes
+            for attr in morsel._reserved:  # type: ignore[attr-defined]
+                if attr in morsel_data and attr not in (
+                    "key",
+                    "value",
+                    "coded_value",
+                ):
+                    morsel[attr] = morsel_data[attr]
+            # Drop the domain so update_cookies() re-marks it host-only.
+            if morsel_data.get("host_only"):
+                morsel["domain"] = ""
+            response_url = (
+                URL.build(scheme="https", host=domain) if domain else URL()
+            )
+            jar.update_cookies({name: morsel}, response_url)
+            # Restore the absolute deadline; update_cookies() schedules none.
+            if (exp := morsel_data.get("expires_timestamp")) is not None:
+                jar._expire_cookie(float(exp), domain, path, name)
+    jar._do_expiration()
+
+
+class PartitionedCookieJar(CookieJar):
+    """Cookie storage that isolates cookies per caller-provided partition.
+
+    Unlike the browser CHIPS partitioned-cookie mechanism, partitions are
+    not derived from the public-suffix list: the caller names each partition
+    by passing an absolute HTTP(S) origin as ``partition_key`` (see
+    :func:`_normalize_partition_key`). Different partitions may hold cookies
+    with the same domain/path/name; all of the regular domain, path, secure
+    and host-only rules still apply independently within every partition.
+
+    Requests made without a ``partition_key`` use the shared default
+    partition and behave exactly like a plain :class:`CookieJar`.
+    """
+
+    def __init__(
+        self,
+        *,
+        unsafe: bool = False,
+        quote_cookie: bool = True,
+        treat_as_secure_origin: StrOrURL | Iterable[StrOrURL] | None = None,
+    ) -> None:
+        super().__init__(
+            unsafe=unsafe,
+            quote_cookie=quote_cookie,
+            treat_as_secure_origin=treat_as_secure_origin,
+        )
+        self._partitioned_cookies: dict[str, CookieJar] = {"": self}
+
+    @property
+    def cookies(self) -> MappingProxyType[tuple[str, str], SimpleCookie]:
+        """Return stored cookies keyed by (partition-qualified domain, path).
+
+        Non-default partitions prefix the domain with the partition key and
+        a NUL separator; the default partition keeps plain (domain, path)
+        pairs with plain CookieJar semantics.
+        """
+        return MappingProxyType(
+            {
+                (f"{partition}\x00{domain}" if partition else domain, path): cookie
+                for partition, jar in self._partitioned_cookies.items()
+                for (domain, path), cookie in jar._cookies.items()
+            }
+        )
+
+    @property
+    def host_only_cookies(self) -> frozenset[tuple[str, str, str]]:
+        """Return host-only cookies as (partition-qualified domain, path, name)."""
+        return frozenset(
+            (f"{partition}\x00{domain}" if partition else domain, path, name)
+            for partition, jar in self._partitioned_cookies.items()
+            for domain, path, name in jar._host_only_cookies
+        )
+
+    def _jar_for_partition(self, partition_key: StrOrURL | None) -> CookieJar:
+        """Return the jar for a partition, creating it on demand."""
+        partition = (
+            ""
+            if partition_key is None
+            else _normalize_partition_key(partition_key)
+        )
+        if partition == "":
+            return self
+        try:
+            return self._partitioned_cookies[partition]
+        except KeyError:
+            jar = CookieJar(
+                unsafe=self._unsafe,
+                quote_cookie=self._quote_cookie,
+                treat_as_secure_origin=tuple(self._treat_as_secure_origin),
+            )
+            self._partitioned_cookies[partition] = jar
+            return jar
+
+    def update_cookies(
+        self,
+        cookies: LooseCookies,
+        response_url: URL = URL(),
+        partition_key: StrOrURL | None = None,
+    ) -> None:
+        """Update cookies in the given partition."""
+        if partition_key is None:
+            super().update_cookies(cookies, response_url)
+        else:
+            self._jar_for_partition(partition_key).update_cookies(
+                cookies, response_url=response_url
+            )
+
+    def update_cookies_from_headers(
+        self,
+        headers: Sequence[str],
+        response_url: URL,
+        partition_key: StrOrURL | None = None,
+    ) -> None:
+        """Update cookies from raw Set-Cookie headers in the given partition."""
+        if partition_key is None:
+            super().update_cookies_from_headers(headers, response_url)
+        else:
+            self._jar_for_partition(partition_key).update_cookies_from_headers(
+                headers, response_url=response_url
+            )
+
+    def filter_cookies(
+        self,
+        request_url: URL,
+        partition_key: StrOrURL | None = None,
+    ) -> "BaseCookie[str]":
+        """Return cookies from one partition filtered by their attributes."""
+        if partition_key is None:
+            return super().filter_cookies(request_url)
+        partition = _normalize_partition_key(partition_key)
+        jar = self._partitioned_cookies.get(partition)
+        if jar is None:
+            return SimpleCookie()
+        return jar.filter_cookies(request_url)
+
+    def clear(
+        self,
+        predicate: ClearCookiePredicate | None = None,
+        *,
+        partition_key: StrOrURL | None = None,
+    ) -> None:
+        """Clear cookies; scoped to one partition when ``partition_key`` given."""
+        if partition_key is None:
+            super().clear(predicate)
+            for partition, jar in self._partitioned_cookies.items():
+                if partition:
+                    jar.clear(predicate)
+            return
+        partition = _normalize_partition_key(partition_key)
+        if partition in self._partitioned_cookies:
+            self._partitioned_cookies[partition].clear(predicate)
+
+    def clear_domain(self, domain: str) -> None:
+        super().clear_domain(domain)
+        for partition, jar in self._partitioned_cookies.items():
+            if partition:
+                jar.clear_domain(domain)
+
+    def __iter__(self) -> "Iterator[Morsel[str]]":
+        yield from super().__iter__()
+        for partition, jar in self._partitioned_cookies.items():
+            if partition:
+                yield from jar
+
+    def __len__(self) -> int:
+        return super().__len__() + sum(
+            len(jar)
+            for partition, jar in self._partitioned_cookies.items()
+            if partition
+        )
+
+    def save(self, file_path: PathLike) -> None:
+        """Save cookies (including their partitions) to a versioned JSON file."""
+        partitions = {
+            partition: {
+                f"{domain}|{path}": {
+                    name: _serialize_morsel(
+                        morsel,
+                        domain,
+                        path,
+                        name,
+                        jar._host_only_cookies,
+                        jar._expirations,
+                    )
+                    for name, morsel in cookie.items()
+                }
+                for (domain, path), cookie in jar._cookies.items()
+            }
+            for partition, jar in self._partitioned_cookies.items()
+        }
+        payload = {
+            "version": _PARTITIONED_JAR_FORMAT_VERSION,
+            "partitions": partitions,
+        }
+        file_path = pathlib.Path(file_path)
+        with open(
+            file_path,
+            mode="w",
+            encoding="utf-8",
+            opener=lambda path, flags: os.open(path, flags, 0o600),
+        ) as f:
+            json.dump(payload, f, indent=2)
+
+    def load(self, file_path: PathLike) -> None:
+        """Load cookies from a versioned JSON file.
+
+        Raises ValueError when the file is corrupted or uses an unsupported
+        version; the current jar is left untouched in that case.
+        """
+        file_path = pathlib.Path(file_path)
+        with file_path.open(mode="r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict) or "version" not in raw:
+            raise ValueError("not a partitioned cookie jar file")
+        version = raw["version"]
+        if version != _PARTITIONED_JAR_FORMAT_VERSION:
+            raise ValueError(
+                f"unsupported partitioned cookie jar file version {version!r}; "
+                f"expected {_PARTITIONED_JAR_FORMAT_VERSION}"
+            )
+        raw_partitions = raw.get("partitions")
+        if not isinstance(raw_partitions, dict):
+            raise ValueError("partitioned cookie jar file is missing 'partitions'")
+
+        default_jar = CookieJar(
+            unsafe=self._unsafe,
+            quote_cookie=self._quote_cookie,
+            treat_as_secure_origin=tuple(self._treat_as_secure_origin),
+        )
+        # The default partition always lives in this instance; extra
+        # partitions get their own jars.
+        staging: dict[str, CookieJar] = {"": default_jar}
+        for partition, data in raw_partitions.items():
+            if not isinstance(partition, str) or not isinstance(data, dict):
+                raise ValueError("invalid partition entry in cookie jar file")
+            if partition:
+                # Round-trip the key through normalization to validate it and
+                # collapse equivalent spellings.
+                partition = _normalize_partition_key(partition)
+                jar = CookieJar(
+                    unsafe=self._unsafe,
+                    quote_cookie=self._quote_cookie,
+                    treat_as_secure_origin=tuple(self._treat_as_secure_origin),
+                )
+            else:
+                jar = default_jar
+            _populate_jar_from_json(jar, data)
+            staging[partition] = jar
+        self._adopt_jar(default_jar)
+        self._partitioned_cookies = staging
+
+
+def _serialize_morsel(
+    morsel: Morsel[str],
+    domain: str,
+    path: str,
+    name: str,
+    host_only_cookies: set[tuple[str, str, str]],
+    expirations: dict[tuple[str, str, str], float],
+) -> dict[str, str | bool | float]:
+    morsel_data: dict[str, str | bool | float] = {
+        "key": morsel.key,
+        "value": morsel.value,
+        "coded_value": morsel.coded_value,
+    }
+    # Skip relative expiry; the absolute deadline is saved below.
+    for attr in morsel._reserved:  # type: ignore[attr-defined]
+        if attr in _RELATIVE_EXPIRY_ATTRS:
+            continue
+        attr_val = morsel[attr]
+        if attr_val:
+            morsel_data[attr] = attr_val
+    # Persist or it reloads as a domain cookie and leaks to subdomains.
+    if (domain, path, name) in host_only_cookies:
+        morsel_data["host_only"] = True
+    if (exp := expirations.get((domain, path, name))) is not None:
+        morsel_data["expires_timestamp"] = exp
+    return morsel_data
+
+
 class DummyCookieJar(AbstractCookieJar):
     """Implements a dummy cookie storage.
 
@@ -643,8 +974,15 @@ class DummyCookieJar(AbstractCookieJar):
     def clear_domain(self, domain: str) -> None:
         pass
 
-    def update_cookies(self, cookies: LooseCookies, response_url: URL = URL()) -> None:
+    def update_cookies(
+        self,
+        cookies: LooseCookies,
+        response_url: URL = URL(),
+        partition_key: StrOrURL | None = None,
+    ) -> None:
         pass
 
-    def filter_cookies(self, request_url: URL) -> "BaseCookie[str]":
+    def filter_cookies(
+        self, request_url: URL, partition_key: StrOrURL | None = None
+    ) -> "BaseCookie[str]":
         return SimpleCookie()

@@ -194,6 +194,7 @@ class _RequestOptions(TypedDict, total=False):
     max_field_size: int | None
     max_headers: int | None
     middlewares: Sequence[ClientMiddlewareType] | None
+    partition_key: StrOrURL | None
 
 
 class _WSConnectOptions(TypedDict, total=False):
@@ -494,6 +495,7 @@ class ClientSession:
         max_field_size: int | None = None,
         max_headers: int | None = None,
         middlewares: Sequence[ClientMiddlewareType] | None = None,
+        partition_key: StrOrURL | None = None,
     ) -> ClientResponse:
         # NOTE: timeout clamps existing connect and read timeouts.  We cannot
         # set the default to None because we need to detect if the user wants
@@ -644,7 +646,12 @@ class ClientSession:
                         if netrc_auth is not None:
                             headers[hdrs.AUTHORIZATION] = netrc_auth
 
-                    all_cookies = self._cookie_jar.filter_cookies(url)
+                    if partition_key is None:
+                        all_cookies = self._cookie_jar.filter_cookies(url)
+                    else:
+                        all_cookies = self._cookie_jar.filter_cookies(
+                            url, partition_key
+                        )
 
                     if cookies is not None:
                         tmp_cookie_jar = CookieJar(
@@ -755,11 +762,21 @@ class ClientSession:
 
                     # Update cookies from raw headers to preserve duplicates
                     if resp._raw_cookie_headers:
-                        self._cookie_jar.update_cookies_from_headers(
-                            resp._raw_cookie_headers, resp.url
-                        )
+                        if partition_key is None:
+                            self._cookie_jar.update_cookies_from_headers(
+                                resp._raw_cookie_headers, resp.url
+                            )
+                        else:
+                            self._cookie_jar.update_cookies_from_headers(
+                                resp._raw_cookie_headers,
+                                resp.url,
+                                partition_key,
+                            )
 
                     # redirects
+                    # partition_key is intentionally not recomputed from
+                    # the redirect target; the whole redirect chain keeps
+                    # the original request's partition.
                     if resp.status in (301, 302, 303, 307, 308) and allow_redirects:
                         for trace in traces:
                             await trace.send_request_redirect(
