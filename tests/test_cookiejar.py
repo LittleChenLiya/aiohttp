@@ -15,7 +15,8 @@ import pytest
 from freezegun import freeze_time
 from yarl import URL
 
-from aiohttp import CookieJar, DummyCookieJar
+from aiohttp import CookieJar, DummyCookieJar, PartitionedCookieJar
+from aiohttp.cookiejar import PARTITIONED_JAR_FORMAT_VERSION, normalize_partition_key
 from aiohttp.typedefs import LooseCookies
 
 
@@ -1980,3 +1981,216 @@ def test_update_cookies_negative_max_age_beyond_float_range_expires() -> None:
 
     assert "sid" not in jar.filter_cookies(url)
     assert len(jar) == 0
+
+
+class TestPartitionedCookieJar:
+    pa = "https://tenant-a.example"
+    pb = "https://tenant-b.example"
+    url = URL("https://shared.example/page")
+
+    def test_normalize_partition_key(self) -> None:
+        assert (
+            normalize_partition_key("http://example.com:80/path?q=1")
+            == "http://example.com"
+        )
+        assert (
+            normalize_partition_key("https://example.com:443") == "https://example.com"
+        )
+        assert (
+            normalize_partition_key("http://example.com:8080")
+            == "http://example.com:8080"
+        )
+        assert (
+            normalize_partition_key("http://xn--r8jz45g.jp/")
+            == normalize_partition_key(URL("http://\u4f8b\u3048.jp/"))
+            == "http://xn--r8jz45g.jp"
+        )
+        for bad in ("ftp://example.com", "/relative", "http://"):
+            with pytest.raises(ValueError, match="partition_key"):
+                normalize_partition_key(bad)
+
+    def test_partitions_are_isolated(self) -> None:
+        jar = PartitionedCookieJar()
+        jar.update_cookies_from_headers(["sid=A"], self.url, partition_key=self.pa)
+        jar.update_cookies_from_headers(["sid=B"], self.url, partition_key=self.pb)
+
+        assert jar.filter_cookies(self.url, partition_key=self.pa)["sid"].value == "A"
+        assert jar.filter_cookies(self.url, partition_key=self.pb)["sid"].value == "B"
+        # No partition_key: the unpartitioned space stays empty and isolated.
+        assert "sid" not in jar.filter_cookies(self.url)
+        assert len(jar) == 2
+        assert jar.partitions == frozenset({self.pa, self.pb})
+
+    def test_different_ports_are_different_partitions(self) -> None:
+        jar = PartitionedCookieJar()
+        jar.update_cookies_from_headers(
+            ["sid=A"], self.url, partition_key="http://example.com:8080"
+        )
+        jar.update_cookies_from_headers(
+            ["sid=B"], self.url, partition_key="http://example.com:9090"
+        )
+        assert (
+            jar.filter_cookies(self.url, partition_key="http://example.com:8080")[
+                "sid"
+            ].value
+            == "A"
+        )
+        assert (
+            jar.filter_cookies(self.url, partition_key="http://example.com:9090")[
+                "sid"
+            ].value
+            == "B"
+        )
+
+    def test_default_ports_normalize_to_one_partition(self) -> None:
+        jar = PartitionedCookieJar()
+        jar.update_cookies_from_headers(
+            ["sid=A"], self.url, partition_key="https://example.com"
+        )
+        assert (
+            jar.filter_cookies(self.url, partition_key="https://example.com:443/")[
+                "sid"
+            ].value
+            == "A"
+        )
+
+    def test_unpartitioned_requests_keep_legacy_behavior(self) -> None:
+        jar = PartitionedCookieJar()
+        jar.update_cookies_from_headers(["sid=legacy"], self.url)
+        assert jar.filter_cookies(self.url)["sid"].value == "legacy"
+        assert "sid" not in jar.filter_cookies(self.url, partition_key=self.pa)
+        # A partitioned cookie must not leak into the unpartitioned space.
+        jar.update_cookies_from_headers(["sid=A"], self.url, partition_key=self.pa)
+        assert jar.filter_cookies(self.url)["sid"].value == "legacy"
+
+    def test_domain_and_host_only_rules_apply_per_partition(self) -> None:
+        jar = PartitionedCookieJar()
+        url = URL("https://sub.example.com/")
+        for partition in (self.pa, self.pb):
+            jar.update_cookies_from_headers(
+                ["sid=A; Domain=example.com"], url, partition_key=partition
+            )
+            jar.update_cookies_from_headers(["host=H"], url, partition_key=partition)
+        a = jar.filter_cookies(url, partition_key=self.pa)
+        assert set(a.keys()) == {"sid", "host"}
+        # Host-only cookie from one identity cannot leak between partitions.
+        assert "host" not in jar.filter_cookies(
+            URL("https://other.example.com/"), partition_key=self.pa
+        )
+        assert "sid" in jar.filter_cookies(
+            URL("https://other.example.com/"), partition_key=self.pb
+        )
+        assert all(
+            identity[1:] == ("sub.example.com", "", "host")
+            for identity in jar.host_only_cookies
+            if identity[3] == "host"
+        )
+
+    def test_clear_and_clear_domain_keep_partition_independence(self) -> None:
+        jar = PartitionedCookieJar()
+        jar.update_cookies_from_headers(["sid=A"], self.url, partition_key=self.pa)
+        jar.update_cookies_from_headers(["sid=B"], self.url, partition_key=self.pb)
+
+        jar.clear()
+        assert len(jar) == 0
+        assert jar.partitions == frozenset()
+
+        # clear_domain in one partition must not touch another one.
+        jar.update_cookies_from_headers(["sid=A"], self.url, partition_key=self.pa)
+        jar.update_cookies_from_headers(["sid=B"], self.url, partition_key=self.pb)
+        jar._jars[self.pa].clear_domain("shared.example")
+        assert "sid" not in jar.filter_cookies(self.url, partition_key=self.pa)
+        assert jar.filter_cookies(self.url, partition_key=self.pb)["sid"].value == "B"
+        jar.clear_domain("shared.example")
+        assert len(jar) == 0
+
+    def test_expiration_is_per_partition(self) -> None:
+        jar = PartitionedCookieJar()
+        with freeze_time("2024-01-01 00:00:00"):
+            jar.update_cookies_from_headers(
+                ["sid=A; Max-Age=10"], self.url, partition_key=self.pa
+            )
+            jar.update_cookies_from_headers(
+                ["sid=B; Max-Age=100"], self.url, partition_key=self.pb
+            )
+        with freeze_time("2024-01-01 00:00:20"):
+            assert "sid" not in jar.filter_cookies(self.url, partition_key=self.pa)
+            assert (
+                jar.filter_cookies(self.url, partition_key=self.pb)["sid"].value == "B"
+            )
+        assert len(jar) == 1
+
+    def test_save_load_roundtrip_keeps_partition_and_host_only(
+        self, tmp_path: Path
+    ) -> None:
+        file_path = tmp_path / "partitioned-cookies.json"
+        jar = PartitionedCookieJar()
+        jar.update_cookies_from_headers(["sid=A"], self.url, partition_key=self.pa)
+        jar.update_cookies_from_headers(
+            ["sid=B; Domain=shared.example"], self.url, partition_key=self.pb
+        )
+        jar.update_cookies_from_headers(["legacy=1"], self.url)
+        jar.save(file_path)
+
+        raw = json.loads(file_path.read_text())
+        assert raw["version"] == PARTITIONED_JAR_FORMAT_VERSION
+
+        loaded = PartitionedCookieJar()
+        loaded.load(file_path)
+        assert loaded.partitions == jar.partitions | {""}
+        assert (
+            loaded.filter_cookies(self.url, partition_key=self.pa)["sid"].value == "A"
+        )
+        assert (
+            loaded.filter_cookies(self.url, partition_key=self.pb)["sid"].value == "B"
+        )
+        assert loaded.filter_cookies(self.url)["legacy"].value == "1"
+        assert (self.pa, "shared.example", "", "sid") in loaded.host_only_cookies
+
+    def test_load_corrupt_file_does_not_replace_state(self, tmp_path: Path) -> None:
+        file_path = tmp_path / "bad.json"
+        jar = PartitionedCookieJar()
+        jar.update_cookies_from_headers(["sid=A"], self.url, partition_key=self.pa)
+
+        file_path.write_text("{not valid json", encoding="utf-8")
+        with pytest.raises(json.JSONDecodeError):
+            jar.load(file_path)
+        assert jar.filter_cookies(self.url, partition_key=self.pa)["sid"].value == "A"
+
+        file_path.write_text(json.dumps({"version": 99, "partitions": {}}))
+        with pytest.raises(ValueError, match="version"):
+            jar.load(file_path)
+        assert jar.filter_cookies(self.url, partition_key=self.pa)["sid"].value == "A"
+
+        file_path.write_text(
+            json.dumps(
+                {
+                    "version": PARTITIONED_JAR_FORMAT_VERSION,
+                    "partitions": {self.pa: {"bad-domain|": "not-a-dict"}},
+                }
+            )
+        )
+        with pytest.raises((ValueError, TypeError, KeyError, AttributeError)):
+            jar.load(file_path)
+        assert jar.filter_cookies(self.url, partition_key=self.pa)["sid"].value == "A"
+
+    def test_load_rejects_invalid_partition_key(self, tmp_path: Path) -> None:
+        file_path = tmp_path / "bad-partition.json"
+        file_path.write_text(
+            json.dumps(
+                {
+                    "version": PARTITIONED_JAR_FORMAT_VERSION,
+                    "partitions": {"ftp://not-http": {}},
+                }
+            )
+        )
+        jar = PartitionedCookieJar()
+        with pytest.raises(ValueError, match="partition"):
+            jar.load(file_path)
+
+    def test_plain_cookiejar_rejects_partition_key(self) -> None:
+        jar = CookieJar()
+        with pytest.raises(TypeError, match="partition_key"):
+            jar.filter_cookies(self.url, partition_key=self.pa)
+        with pytest.raises(TypeError, match="partition_key"):
+            jar.update_cookies(SimpleCookie("sid=A"), self.url, partition_key=self.pa)

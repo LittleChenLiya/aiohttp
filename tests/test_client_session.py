@@ -801,11 +801,24 @@ async def test_cookie_jar_usage(aiohttp_client: AiohttpClient) -> None:
         def clear_domain(self, domain: str) -> None:
             self._clear_domain_mock(domain)
 
-        def update_cookies(self, cookies: Any, response_url: URL = URL()) -> None:
-            self._update_cookies_mock(cookies, response_url)
+        def update_cookies(
+            self,
+            cookies: Any,
+            response_url: URL = URL(),
+            *,
+            partition_key: Any = None,
+        ) -> None:
+            self._update_cookies_mock(
+                cookies, response_url, partition_key=partition_key
+            )
 
-        def filter_cookies(self, request_url: URL) -> BaseCookie[str]:
-            return cast(BaseCookie[str], self._filter_cookies_mock(request_url))
+        def filter_cookies(
+            self, request_url: URL, *, partition_key: Any = None
+        ) -> BaseCookie[str]:
+            return cast(
+                BaseCookie[str],
+                self._filter_cookies_mock(request_url, partition_key=partition_key),
+            )
 
         def __len__(self) -> int:
             return len(self._items)
@@ -839,7 +852,9 @@ async def test_cookie_jar_usage(aiohttp_client: AiohttpClient) -> None:
     )
 
     # Updating the cookie jar with initial user defined cookies
-    jar._update_cookies_mock.assert_called_with({"request": "req_value"}, URL())
+    jar._update_cookies_mock.assert_called_with(
+        {"request": "req_value"}, URL(), partition_key=None
+    )
 
     jar._update_cookies_mock.reset_mock()
     resp = await session.get("/")
@@ -848,7 +863,7 @@ async def test_cookie_jar_usage(aiohttp_client: AiohttpClient) -> None:
 
     # Filtering the cookie jar before sending the request,
     # getting the request URL as only parameter
-    jar._filter_cookies_mock.assert_called_with(URL(req_url))
+    jar._filter_cookies_mock.assert_called_with(URL(req_url), partition_key=None)
 
     # Updating the cookie jar with the response cookies
     assert jar._update_cookies_mock.called
@@ -858,6 +873,34 @@ async def test_cookie_jar_usage(aiohttp_client: AiohttpClient) -> None:
     assert len(resp_cookies) == 1
     assert resp_cookies[0][0] == "response"
     assert resp_cookies[0][1].value == "resp_value"
+
+
+async def test_partition_key_rejected_by_plain_cookie_jar(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    async def handler(_: web.Request) -> web.Response:
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app, cookie_jar=CookieJar())
+
+    with pytest.raises(TypeError, match="partition_key"):
+        await client.get("/", partition_key="https://tenant.example")
+
+
+async def test_partition_key_validated_before_request(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    async def handler(_: web.Request) -> web.Response:
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app, cookie_jar=aiohttp.PartitionedCookieJar())
+
+    with pytest.raises(ValueError, match="partition_key"):
+        await client.get("/", partition_key="not-an-origin")
 
 
 async def test_cookies_with_not_quoted_cookie_jar(

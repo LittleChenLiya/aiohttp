@@ -10,7 +10,7 @@ from multidict import CIMultiDict
 from yarl import URL
 
 from ._cookie_helpers import parse_set_cookie_headers
-from .typedefs import LooseCookies
+from .typedefs import LooseCookies, StrOrURL
 
 if TYPE_CHECKING:
     from .web_app import Application
@@ -166,13 +166,18 @@ class AbstractCookieJar(Sized, Iterable[Morsel[str]]):
 
     @property
     @abstractmethod
-    def cookies(self) -> MappingProxyType[tuple[str, str], SimpleCookie]:
-        """Return the cookies stored in this jar."""
+    def cookies(self) -> MappingProxyType[tuple[Any, ...], SimpleCookie]:
+        """Return the cookies stored in this jar.
+
+        Keys are ``(domain, path)`` tuples for :class:`~aiohttp.CookieJar`
+        and ``(partition, domain, path)`` for
+        :class:`~aiohttp.PartitionedCookieJar`.
+        """
 
     @property
     @abstractmethod
-    def host_only_cookies(self) -> frozenset[tuple[str, str, str]]:
-        """Return the host-only cookies stored in this jar."""
+    def host_only_cookies(self) -> frozenset[tuple[Any, ...]]:
+        """Return the host-only cookie identities stored in this jar."""
 
     @abstractmethod
     def clear(self, predicate: ClearCookiePredicate | None = None) -> None:
@@ -183,18 +188,32 @@ class AbstractCookieJar(Sized, Iterable[Morsel[str]]):
         """Clear all cookies for domain and all subdomains."""
 
     @abstractmethod
-    def update_cookies(self, cookies: LooseCookies, response_url: URL = URL()) -> None:
+    def update_cookies(
+        self,
+        cookies: LooseCookies,
+        response_url: URL = URL(),
+        *,
+        partition_key: StrOrURL | None = None,
+    ) -> None:
         """Update cookies."""
 
     def update_cookies_from_headers(
-        self, headers: Sequence[str], response_url: URL
+        self,
+        headers: Sequence[str],
+        response_url: URL,
+        *,
+        partition_key: StrOrURL | None = None,
     ) -> None:
         """Update cookies from raw Set-Cookie headers."""
         if headers and (cookies_to_update := parse_set_cookie_headers(headers)):
-            self.update_cookies(cookies_to_update, response_url)
+            self.update_cookies(
+                cookies_to_update, response_url, partition_key=partition_key
+            )
 
     @abstractmethod
-    def filter_cookies(self, request_url: URL) -> BaseCookie[str]:
+    def filter_cookies(
+        self, request_url: URL, *, partition_key: StrOrURL | None = None
+    ) -> BaseCookie[str]:
         """Return the jar's cookies filtered by their attributes."""
 
 

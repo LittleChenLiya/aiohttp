@@ -2922,6 +2922,249 @@ async def test_set_cookies(
     assert "Can not load cookies: Illegal cookie name 'invalid,cookie'" in caplog.text
 
 
+async def test_partitioned_cookie_jar_isolation_loopback(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """Two partitions set sid for the same target URL and stay isolated."""
+
+    async def set_cookie(request: web.Request) -> web.Response:
+        value = request.query["sid"]
+        ret = web.Response(text=value)
+        ret.set_cookie("sid", value)
+        return ret
+
+    async def echo(request: web.Request) -> web.Response:
+        return web.Response(text=request.cookies.get("sid", ""))
+
+    app = web.Application()
+    app.router.add_get("/set", set_cookie)
+    app.router.add_get("/echo", echo)
+    server = await aiohttp_server(app)
+    pa = f"http://partition-a.local:{server.port}"
+    pb = f"http://partition-b.local:{server.port}"
+
+    jar = aiohttp.PartitionedCookieJar(unsafe=True)
+    async with aiohttp.ClientSession(cookie_jar=jar) as session:
+        async with session.get(server.make_url("/set?sid=A"), partition_key=pa) as resp:
+            assert await resp.text() == "A"
+        async with session.get(server.make_url("/set?sid=B"), partition_key=pb) as resp:
+            assert await resp.text() == "B"
+
+        async with session.get(server.make_url("/echo"), partition_key=pa) as resp:
+            assert await resp.text() == "A"
+        async with session.get(server.make_url("/echo"), partition_key=pb) as resp:
+            assert await resp.text() == "B"
+        # Requests without partition_key use the unpartitioned space.
+        async with session.get(server.make_url("/echo")) as resp:
+            assert await resp.text() == ""
+
+
+async def test_partitioned_cookie_jar_redirect_keeps_original_partition(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """Redirects must keep using the original request partition."""
+
+    async def set_and_redirect(request: web.Request) -> web.Response:
+        ret = web.Response(status=302)
+        ret.set_cookie("sid", request.query["sid"])
+        ret.headers[hdrs.LOCATION] = str(request.url.with_path("/echo"))
+        return ret
+
+    async def echo(request: web.Request) -> web.Response:
+        return web.Response(text=request.cookies.get("sid", ""))
+
+    app = web.Application()
+    app.router.add_get("/start", set_and_redirect)
+    app.router.add_get("/echo", echo)
+    server = await aiohttp_server(app)
+    pa = f"http://partition-a.local:{server.port}"
+    pb = f"http://partition-b.local:{server.port}"
+
+    jar = aiohttp.PartitionedCookieJar(unsafe=True)
+    async with aiohttp.ClientSession(cookie_jar=jar) as session:
+        async with session.get(
+            server.make_url("/start?sid=A"), partition_key=pa
+        ) as resp:
+            # The cookie stored under pa is sent on the redirect hop.
+            assert await resp.text() == "A"
+        async with session.get(
+            server.make_url("/start?sid=B"), partition_key=pb
+        ) as resp:
+            assert await resp.text() == "B"
+        async with session.get(server.make_url("/echo"), partition_key=pa) as resp:
+            assert await resp.text() == "A"
+        async with session.get(server.make_url("/echo"), partition_key=pb) as resp:
+            assert await resp.text() == "B"
+
+
+async def test_partitioned_cookie_jar_cross_origin_redirect(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """A cross-origin redirect keeps storing cookies in the start partition."""
+
+    seen_cookies: list[str] = []
+
+    async def start(request: web.Request) -> web.Response:
+        ret = web.Response(status=302)
+        ret.set_cookie("sid", "A")
+        ret.headers[hdrs.LOCATION] = str(target_server.make_url("/echo"))
+        return ret
+
+    async def target_echo(request: web.Request) -> web.Response:
+        seen_cookies.append(request.headers.get(hdrs.COOKIE, ""))
+        ret = web.Response(text=request.cookies.get("sid", ""))
+        ret.set_cookie("target", "T")
+        return ret
+
+    start_app = web.Application()
+    start_app.router.add_get("/start", start)
+    target_app = web.Application()
+    target_app.router.add_get("/echo", target_echo)
+    start_server = await aiohttp_server(start_app)
+    target_server = await aiohttp_server(target_app)
+    partition = "http://embed.local"
+
+    jar = aiohttp.PartitionedCookieJar(unsafe=True)
+    async with aiohttp.ClientSession(cookie_jar=jar) as session:
+        async with session.get(
+            start_server.make_url("/start"), partition_key=partition
+        ) as resp:
+            # Different origin/port: without the partition the start cookie
+            # could not be sent to the target. The fixed partition makes it
+            # available throughout the redirect chain.
+            assert await resp.text() == "A"
+            assert seen_cookies == ["sid=A"]
+
+        # The target's Set-Cookie landed in the same start partition and is
+        # not rebuilt from the redirect target origin.
+        target_cookies = jar.filter_cookies(
+            target_server.make_url("/echo"), partition_key=partition
+        )
+        assert target_cookies["target"].value == "T"
+        assert "target" not in jar.filter_cookies(target_server.make_url("/echo"))
+
+
+async def test_partitioned_cookie_jar_expiration(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """Faked clock: A expires while B is retained."""
+
+    async def set_cookie(request: web.Request) -> web.Response:
+        ret = web.Response(text="ok")
+        max_age = 100 if request.query["sid"] == "A" else 300
+        ret.set_cookie("sid", request.query["sid"], max_age=max_age)
+        return ret
+
+    async def echo(request: web.Request) -> web.Response:
+        return web.Response(text=request.cookies.get("sid", ""))
+
+    app = web.Application()
+    app.router.add_get("/set", set_cookie)
+    app.router.add_get("/echo", echo)
+    server = await aiohttp_server(app)
+    pa = f"http://partition-a.local:{server.port}"
+    pb = f"http://partition-b.local:{server.port}"
+
+    frozen_time = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+    jar = aiohttp.PartitionedCookieJar(unsafe=True)
+    with mock.patch(
+        "aiohttp.cookiejar.time.time", return_value=frozen_time.timestamp()
+    ) as freezer:
+        async with aiohttp.ClientSession(cookie_jar=jar) as session:
+            await session.get(server.make_url("/set?sid=A"), partition_key=pa)
+            await session.get(server.make_url("/set?sid=B"), partition_key=pb)
+            freezer.return_value = frozen_time.timestamp() + 50
+            async with session.get(server.make_url("/echo"), partition_key=pa) as resp:
+                assert await resp.text() == "A"
+            # Advance beyond the Max-Age: A is expired, B remains.
+            freezer.return_value = frozen_time.timestamp() + 101
+            async with session.get(server.make_url("/echo"), partition_key=pa) as resp:
+                assert await resp.text() == ""
+            async with session.get(server.make_url("/echo"), partition_key=pb) as resp:
+                assert await resp.text() == "B"
+
+
+async def test_partitioned_cookie_jar_save_load_loopback(
+    aiohttp_server: AiohttpServer, tmp_path: pathlib.Path
+) -> None:
+    """Saving and reloading keeps host-only state and the partition."""
+
+    async def set_cookie(request: web.Request) -> web.Response:
+        ret = web.Response(text="ok")
+        ret.set_cookie("sid", request.query["sid"])
+        return ret
+
+    async def echo(request: web.Request) -> web.Response:
+        return web.Response(text=request.cookies.get("sid", ""))
+
+    app = web.Application()
+    app.router.add_get("/set", set_cookie)
+    app.router.add_get("/echo", echo)
+    server = await aiohttp_server(app)
+    pa = f"http://partition-a.local:{server.port}"
+    pb = f"http://partition-b.local:{server.port}"
+    cookie_file = tmp_path / "partitioned.json"
+
+    jar = aiohttp.PartitionedCookieJar(unsafe=True)
+    async with aiohttp.ClientSession(cookie_jar=jar) as session:
+        await session.get(server.make_url("/set?sid=A"), partition_key=pa)
+        await session.get(server.make_url("/set?sid=B"), partition_key=pb)
+    await asyncio.to_thread(jar.save, cookie_file)
+
+    reloaded = aiohttp.PartitionedCookieJar(unsafe=True)
+    await asyncio.to_thread(reloaded.load, cookie_file)
+    # The cookies were set without a Domain attribute: host-only survives.
+    assert (pa, "127.0.0.1", "", "sid") in reloaded.host_only_cookies
+    assert (pb, "127.0.0.1", "", "sid") in reloaded.host_only_cookies
+    async with aiohttp.ClientSession(cookie_jar=reloaded) as session:
+        async with session.get(server.make_url("/echo"), partition_key=pa) as resp:
+            assert await resp.text() == "A"
+        async with session.get(server.make_url("/echo"), partition_key=pb) as resp:
+            assert await resp.text() == "B"
+
+
+async def test_partitioned_cookie_jar_concurrent_interleaving(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """Interleaved requests never share a mutable current partition."""
+    finish = asyncio.Event()
+
+    async def set_cookie(request: web.Request) -> web.StreamResponse:
+        ret = web.StreamResponse()
+        ret.set_cookie("sid", request.query["sid"])
+        await ret.prepare(request)
+        if request.query["sid"] == "A":
+            await finish.wait()
+        return ret
+
+    async def echo(request: web.Request) -> web.Response:
+        return web.Response(text=request.cookies.get("sid", ""))
+
+    app = web.Application()
+    app.router.add_get("/set", set_cookie)
+    app.router.add_get("/echo", echo)
+    server = await aiohttp_server(app)
+    pa = f"http://partition-a.local:{server.port}"
+    pb = f"http://partition-b.local:{server.port}"
+
+    jar = aiohttp.PartitionedCookieJar(unsafe=True)
+    async with aiohttp.ClientSession(cookie_jar=jar) as session:
+        task_a = asyncio.create_task(
+            session.get(server.make_url("/set?sid=A"), partition_key=pa)
+        )
+        await asyncio.sleep(0.1)
+        async with session.get(server.make_url("/set?sid=B"), partition_key=pb) as resp:
+            assert resp.status == 200
+        finish.set()
+        resp_a = await task_a
+        resp_a.release()
+
+        async with session.get(server.make_url("/echo"), partition_key=pa) as resp:
+            assert await resp.text() == "A"
+        async with session.get(server.make_url("/echo"), partition_key=pb) as resp:
+            assert await resp.text() == "B"
+
+
 async def test_set_cookies_with_curly_braces(aiohttp_client: AiohttpClient) -> None:
     """Test that cookies with curly braces in names are now accepted (#2683)."""
 
@@ -3024,7 +3267,11 @@ async def test_connection_released_when_cookie_processing_fails(
 ) -> None:
     class EvilJar(aiohttp.CookieJar):
         def update_cookies_from_headers(
-            self, headers: Sequence[str], response_url: URL
+            self,
+            headers: Sequence[str],
+            response_url: URL,
+            *,
+            partition_key: Any = None,
         ) -> None:
             raise RuntimeError("boom")
 

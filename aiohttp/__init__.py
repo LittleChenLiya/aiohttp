@@ -51,7 +51,12 @@ from .client_middleware_digest_auth import DigestAuthMiddleware
 from .client_middlewares import ClientHandlerType, ClientMiddlewareType
 from .compression_utils import set_zlib_backend
 from .connector import AddrInfoType, SocketFactoryType
-from .cookiejar import CookieJar, DummyCookieJar
+from .cookiejar import (
+    CookieJar,
+    DummyCookieJar,
+    PartitionedCookieJar,
+    normalize_partition_key,
+)
 from .formdata import FormData
 from .helpers import ChainMapProxy, ETag, encode_basic_auth
 from .http import (
@@ -187,6 +192,8 @@ __all__: tuple[str, ...] = (
     "BodyPartReader",
     "MultipartReader",
     "MultipartWriter",
+    "PartitionedCookieJar",
+    "normalize_partition_key",
     "content_disposition_filename",
     "parse_content_disposition",
     # payload

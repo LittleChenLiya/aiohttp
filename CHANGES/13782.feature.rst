@@ -1,0 +1,5 @@
+Added :class:`aiohttp.PartitionedCookieJar`, a cookie jar that isolates
+cookies by a caller-supplied absolute HTTP(S) origin, and a
+``partition_key`` parameter to client requests that is kept across
+redirects. Use :func:`aiohttp.normalize_partition_key` to normalize an
+origin into the scheme, IDNA host and effective port -- by :user:`bdraco`.

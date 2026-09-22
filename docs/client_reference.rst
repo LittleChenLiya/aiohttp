@@ -439,7 +439,14 @@ The client session supports the context manager protocol for self closing.
                      - :class:`collections.abc.Iterable` e.g. :class:`tuple` or
                        :class:`list`
                      - :class:`str` with preferably url-encoded content
-                       (**Warning:** content will not be encoded by *aiohttp*)
+                      (**Warning:** content will not be encoded by *aiohttp*)
+
+      :param partition_key: Absolute HTTP(S) origin (:class:`str` or
+                     :class:`~yarl.URL`) selecting the cookie partition
+                     for a :class:`PartitionedCookieJar`. The partition is
+                     kept for the whole request, including redirects.
+                     Ignored cookies-wise unless the session uses a
+                     :class:`PartitionedCookieJar`.
 
       :param data: The data to send in the body of the request. This can be a
                    :class:`FormData` object or anything that can be passed into
@@ -942,6 +949,11 @@ certification chaining.
                      :class:`list`
                   - :class:`str` with preferably url-encoded content
                      (**Warning:** content will not be encoded by *aiohttp*)
+
+   :param partition_key: Absolute HTTP(S) origin (:class:`str` or
+                :class:`~yarl.URL`) selecting the cookie partition for a
+                :class:`PartitionedCookieJar`. The partition is kept for
+                the whole request, including redirects.
 
    :param data: The data to send in the body of the request. This can be a
                 :class:`FormData` object or anything that can be passed into
@@ -2582,6 +2594,46 @@ Utilities
 
       jar = aiohttp.DummyCookieJar()
       session = aiohttp.ClientSession(cookie_jar=DummyCookieJar())
+
+
+.. class:: PartitionedCookieJar(*, unsafe=False, quote_cookie=True, treat_as_secure_origin=[])
+   :canonical: aiohttp.cookiejar.PartitionedCookieJar
+
+   Cookie jar that isolates cookies by caller-supplied partition key::
+
+       jar = aiohttp.PartitionedCookieJar()
+       async with aiohttp.ClientSession(cookie_jar=jar) as session:
+           await session.get(url, partition_key="https://tenant-a.example")
+           await session.get(url, partition_key="https://tenant-b.example")
+
+   ``partition_key`` must be an absolute HTTP(S) origin. It is normalized
+   to scheme, IDNA host and effective port, so ``http://example.com:80``
+   and ``http://example.com`` identify the same partition. The same
+   ``domain/path/name`` cookie may exist independently in every
+   partition; the usual RFC 6265 domain, path, secure and host-only rules
+   still apply within each one. Requests made without ``partition_key``
+   use an unpartitioned space, like a regular :class:`CookieJar`.
+
+   The partition is fixed for the lifetime of a request, including
+   redirects: a redirect never rebuilds the partition from the target
+   origin. This is not a browser CHIPS implementation; no public suffix
+   list is used.
+
+   :meth:`save` writes a versioned JSON file and :meth:`load` rejects
+   corrupt files and unsupported format versions without discarding the
+   jar's current contents.
+
+   .. versionadded:: 4.0
+
+.. function:: normalize_partition_key(partition_key)
+   :canonical: aiohttp.cookiejar.normalize_partition_key
+
+   Normalize an absolute HTTP(S) origin (:class:`str` or
+   :class:`~yarl.URL`) into a partition key containing the scheme, IDNA
+   host and effective port. Raises :class:`ValueError` for non-HTTP(S)
+   or relative input.
+
+   .. versionadded:: 4.0
 
 
 .. class:: Fingerprint(digest)

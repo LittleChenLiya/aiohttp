@@ -84,7 +84,7 @@ from .client_ws import (
     ClientWSTimeout,
 )
 from .connector import BaseConnector, NamedPipeConnector, TCPConnector, UnixConnector
-from .cookiejar import CookieJar
+from .cookiejar import CookieJar, normalize_partition_key
 from .helpers import (
     _SENTINEL,
     DEFAULT_CHUNK_SIZE,
@@ -170,6 +170,7 @@ if sys.version_info >= (3, 11) and TYPE_CHECKING:
 
 class _RequestOptions(TypedDict, total=False):
     params: Query
+    partition_key: StrOrURL | None
     data: Any
     json: Any
     cookies: LooseCookies | None
@@ -468,6 +469,7 @@ class ClientSession:
         str_or_url: StrOrURL,
         *,
         params: Query = None,
+        partition_key: StrOrURL | None = None,
         data: Any = None,
         json: Any = None,
         cookies: LooseCookies | None = None,
@@ -534,6 +536,12 @@ class ClientSession:
             url = self._build_url(str_or_url)
         except ValueError as e:
             raise InvalidUrlClientError(str_or_url) from e
+
+        # Normalize once: redirects keep using the original request's
+        # partition instead of rebuilding it from the redirect target.
+        partition = (
+            None if partition_key is None else normalize_partition_key(partition_key)
+        )
 
         assert self._connector is not None
         if url.scheme not in self._connector.allowed_protocol_schema_set:
@@ -644,7 +652,9 @@ class ClientSession:
                         if netrc_auth is not None:
                             headers[hdrs.AUTHORIZATION] = netrc_auth
 
-                    all_cookies = self._cookie_jar.filter_cookies(url)
+                    all_cookies = self._cookie_jar.filter_cookies(
+                        url, partition_key=partition
+                    )
 
                     if cookies is not None:
                         tmp_cookie_jar = CookieJar(
@@ -756,7 +766,7 @@ class ClientSession:
                     # Update cookies from raw headers to preserve duplicates
                     if resp._raw_cookie_headers:
                         self._cookie_jar.update_cookies_from_headers(
-                            resp._raw_cookie_headers, resp.url
+                            resp._raw_cookie_headers, resp.url, partition_key=partition
                         )
 
                     # redirects
