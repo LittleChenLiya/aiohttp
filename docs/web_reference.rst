@@ -961,12 +961,17 @@ and :ref:`aiohttp-web-signals` handlers::
       :attr:`~aiohttp.StreamResponse.body`, represented as :class:`str`.
 
 
-.. class:: FileResponse(*, path, chunk_size=256*1024, status=200, reason=None, headers=None, text_charset=None)
+.. class:: FileResponse(*, path, chunk_size=256*1024, status=200, reason=None, headers=None, text_charset=None, max_ranges=16)
    :canonical: aiohttp.web_fileresponse.FileResponse
 
    The response class used to send files, inherited from :class:`StreamResponse`.
 
-   Supports the ``Content-Range`` and ``If-Range`` HTTP Headers in requests.
+   Supports the ``Range`` and ``If-Range`` HTTP Headers in requests.
+   Requests with multiple byte ranges are answered with a
+   ``multipart/byteranges`` response generated from the identity
+   (uncompressed) representation. Syntactically invalid ``Range``
+   headers and headers listing more than *max_ranges* range specs
+   are ignored.
 
    The actual :attr:`body` sending happens in overridden :meth:`~StreamResponse.prepare`.
 
@@ -998,6 +1003,13 @@ and :ref:`aiohttp-web-signals` handlers::
                             charset is added.
 
                             .. versionadded:: 3.15
+
+   :param int max_ranges: maximum number of range specs accepted in the
+                           ``Range`` request header. A header listing
+                           more ranges is ignored and the full
+                           representation is sent. Defaults to 16.
+
+                           .. versionadded:: 4.0
 
 
 .. class:: WebSocketResponse(*, timeout=10.0, receive_timeout=None, \
