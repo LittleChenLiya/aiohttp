@@ -1,0 +1,5 @@
+Added support for multiple byte ranges in :class:`~aiohttp.web.FileResponse`:
+a ``Range`` header with several ranges is now answered with a
+``multipart/byteranges`` response, with overlapping or adjacent ranges merged,
+unsatisfiable ranges dropped, and invalid ``Range`` headers ignored in favor
+of a full ``200`` response -- by :user:`aio-libs`.

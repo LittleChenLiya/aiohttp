@@ -995,41 +995,21 @@ async def test_static_file_invalid_range(
     app.router.add_get("/", handler)
     client = await aiohttp_client(app)
 
-    # range must be in bytes
-    resp = await client.get("/", headers={"Range": "blocks=0-10"})
-    assert resp.status == 416, "Range must be in bytes"
-    resp.close()
-    resp.release()
-
-    # start > end
-    resp = await client.get("/", headers={"Range": "bytes=100-0"})
-    assert resp.status == 416, "Range start can't be greater than end"
-    resp.close()
-    resp.release()
-
-    # start > end
-    resp = await client.get("/", headers={"Range": "bytes=10-9"})
-    assert resp.status == 416, "Range start can't be greater than end"
-    resp.close()
-    resp.release()
-
-    # non-number range
-    resp = await client.get("/", headers={"Range": "bytes=a-f"})
-    assert resp.status == 416, "Range must be integers"
-    resp.close()
-    resp.release()
-
-    # double dash range
-    resp = await client.get("/", headers={"Range": "bytes=0--10"})
-    assert resp.status == 416, "double dash in range"
-    resp.close()
-    resp.release()
-
-    # no range
-    resp = await client.get("/", headers={"Range": "bytes=-"})
-    assert resp.status == 416, "no range given"
-    resp.close()
-    resp.release()
+    # A syntactically invalid Range header is ignored: the server
+    # responds with the full representation (200) and no Content-Range.
+    for range_header in (
+        "blocks=0-10",  # range unit must be bytes
+        "bytes=100-0",  # start > end
+        "bytes=10-9",  # start > end
+        "bytes=a-f",  # non-number range
+        "bytes=0--10",  # double dash in range
+        "bytes=-",  # no range given
+    ):
+        resp = await client.get("/", headers={"Range": range_header})
+        assert resp.status == 200, f"Range {range_header!r} must be ignored"
+        assert "Content-Range" not in resp.headers
+        resp.close()
+        resp.release()
 
     await client.close()
 
@@ -1413,3 +1393,277 @@ async def test_sendfile_after_client_disconnect(
     request_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await request_task
+
+
+def _multipart_body(
+    boundary: str,
+    content_type: str,
+    file_size: int,
+    parts: Iterable[tuple[int, bytes]],
+) -> bytes:
+    """Build the exact expected multipart/byteranges body."""
+    body = b""
+    for start, data in parts:
+        body += (
+            f"--{boundary}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            f"Content-Range: bytes {start}-{start + len(data) - 1}/{file_size}\r\n"
+            f"\r\n"
+        ).encode()
+        body += data + b"\r\n"
+    return body + f"--{boundary}--\r\n".encode()
+
+
+def _multipart_boundary(content_type_header: str) -> str:
+    media_type, _, params = content_type_header.partition(";")
+    assert media_type == "multipart/byteranges"
+    name, _, boundary = params.strip().partition("=")
+    assert name == "boundary"
+    assert boundary and len(boundary) <= 70
+    return boundary
+
+
+@pytest.fixture
+def digit_file(tmp_path: pathlib.Path) -> pathlib.Path:
+    filepath = tmp_path / "data.bin"
+    filepath.write_bytes(b"0123456789")
+    return filepath
+
+
+async def test_static_file_multi_range_two_parts(
+    aiohttp_client: AiohttpClient, digit_file: pathlib.Path
+) -> None:
+    """bytes=0-1,8- returns the head and tail of the file as two parts."""
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(digit_file)
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/", headers={"Range": "bytes=0-1,8-"})
+    assert resp.status == 206
+    boundary = _multipart_boundary(resp.headers["Content-Type"])
+    body = await resp.read()
+    expected = _multipart_body(
+        boundary,
+        "application/octet-stream",
+        10,
+        [(0, b"01"), (8, b"89")],
+    )
+    assert body == expected
+    assert int(resp.headers["Content-Length"]) == len(expected)
+
+
+async def test_static_file_multi_range_merged_into_single(
+    aiohttp_client: AiohttpClient, digit_file: pathlib.Path
+) -> None:
+    """Overlapping/adjacent ranges are merged into a single 206."""
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(digit_file)
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/", headers={"Range": "bytes=0-2,2-4"})
+    assert resp.status == 206
+    assert resp.headers["Content-Range"] == "bytes 0-4/10"
+    assert await resp.read() == b"01234"
+
+
+async def test_static_file_multi_range_unsatisfiable(
+    aiohttp_client: AiohttpClient, digit_file: pathlib.Path
+) -> None:
+    """A syntactically valid but unsatisfiable range set returns 416."""
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(digit_file)
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/", headers={"Range": "bytes=99-100"})
+    assert resp.status == 416
+    assert resp.headers["Content-Range"] == "bytes */10"
+
+
+async def test_static_file_multi_range_mixed_satisfiable(
+    aiohttp_client: AiohttpClient, digit_file: pathlib.Path
+) -> None:
+    """Unsatisfiable parts of a mixed range set are dropped."""
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(digit_file)
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/", headers={"Range": "bytes=0-1,99-100"})
+    assert resp.status == 206
+    assert resp.headers["Content-Range"] == "bytes 0-1/10"
+    assert await resp.read() == b"01"
+
+
+async def test_static_file_multi_range_suffix_and_open_end(
+    aiohttp_client: AiohttpClient, digit_file: pathlib.Path
+) -> None:
+    """Suffix and open-ended ranges combine into ordered parts."""
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(digit_file)
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/", headers={"Range": "bytes=-2,0-1,4-"})
+    assert resp.status == 206
+    boundary = _multipart_boundary(resp.headers["Content-Type"])
+    body = await resp.read()
+    expected = _multipart_body(
+        boundary,
+        "application/octet-stream",
+        10,
+        [(0, b"01"), (4, b"456789")],
+    )
+    assert body == expected
+
+
+async def test_static_file_too_many_ranges_ignored(
+    aiohttp_client: AiohttpClient, digit_file: pathlib.Path
+) -> None:
+    """More than MAX_RANGES range items ignores the Range header."""
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(digit_file)
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    range_header = ",".join(f"bytes={i}-{i}" for i in range(17))
+    resp = await client.get("/", headers={"Range": range_header})
+    assert resp.status == 200
+    assert await resp.read() == b"0123456789"
+
+
+async def test_static_file_range_empty_file(
+    aiohttp_client: AiohttpClient, tmp_path: pathlib.Path
+) -> None:
+    """Any range against an empty file is unsatisfiable."""
+    filepath = tmp_path / "empty.bin"
+    filepath.write_bytes(b"")
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(filepath)
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/", headers={"Range": "bytes=0-"})
+    assert resp.status == 416
+    assert resp.headers["Content-Range"] == "bytes */0"
+
+
+async def test_static_file_range_huge_numbers(
+    aiohttp_client: AiohttpClient, digit_file: pathlib.Path
+) -> None:
+    """Huge integers in ranges are clipped to the file size."""
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(digit_file)
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    resp = await client.get("/", headers={"Range": "bytes=0-99999999999999999999"})
+    assert resp.status == 206
+    assert resp.headers["Content-Range"] == "bytes 0-9/10"
+    assert await resp.read() == b"0123456789"
+
+
+async def test_static_file_multi_range_head_get_and_if_range(
+    aiohttp_client: AiohttpClient, digit_file: pathlib.Path
+) -> None:
+    """Loopback integration: byte-exact multipart, HEAD, and If-Range."""
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(digit_file)
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    # GET: the multipart body matches the declared Content-Length byte for byte.
+    async with client.get("/", headers={"Range": "bytes=0-1,8-"}) as resp:
+        assert resp.status == 206
+        boundary = _multipart_boundary(resp.headers["Content-Type"])
+        body = await resp.read()
+        expected = _multipart_body(
+            boundary, "application/octet-stream", 10, [(0, b"01"), (8, b"89")]
+        )
+        assert body == expected
+        assert int(resp.headers["Content-Length"]) == len(body)
+        multipart_etag = resp.headers["ETag"]
+
+    # HEAD: same headers and Content-Length, but no body is sent.
+    async with client.head("/", headers={"Range": "bytes=0-1,8-"}) as resp:
+        assert resp.status == 206
+        assert resp.headers["Content-Type"].startswith("multipart/byteranges;")
+        assert int(resp.headers["Content-Length"]) == len(expected)
+        assert await resp.read() == b""
+
+    # If-Range mismatch: the Range header is not processed, full 200.
+    async with client.get(
+        "/", headers={"If-Range": '"stale-etag"', "Range": "bytes=0-1,8-"}
+    ) as resp:
+        assert resp.status == 200
+        assert "Content-Range" not in resp.headers
+        assert not resp.headers["Content-Type"].startswith("multipart/")
+        assert await resp.read() == b"0123456789"
+
+    # The multipart 206 carries the identity representation ETag.
+    async with client.get("/") as resp:
+        assert resp.status == 200
+        assert resp.headers["ETag"] == multipart_etag
+
+
+async def test_static_file_multi_range_precompressed_uses_identity(
+    aiohttp_client: AiohttpClient, tmp_path: pathlib.Path
+) -> None:
+    """Multi-range requests select the identity representation, not the .gz."""
+    filepath = tmp_path / "data.txt"
+    filepath.write_bytes(b"0123456789")
+    compressed = tmp_path / "data.txt.gz"
+    compressed.write_bytes(gzip.compress(b"0123456789"))
+
+    async def handler(request: web.Request) -> web.FileResponse:
+        return web.FileResponse(filepath)
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    client = await aiohttp_client(app)
+
+    async with client.get(
+        "/",
+        headers={"Accept-Encoding": "gzip", "Range": "bytes=0-1,8-"},
+        auto_decompress=False,
+    ) as resp:
+        assert resp.status == 206
+        assert "Content-Encoding" not in resp.headers
+        boundary = _multipart_boundary(resp.headers["Content-Type"])
+        body = await resp.read()
+        expected = _multipart_body(boundary, "text/plain", 10, [(0, b"01"), (8, b"89")])
+        assert body == expected
+        identity_etag = resp.headers["ETag"]
+
+    # The identity ETag is used, not the compressed variant ETag.
+    async with client.get("/", headers={"Accept-Encoding": "gzip"}) as resp:
+        assert resp.headers["ETag"] != identity_etag

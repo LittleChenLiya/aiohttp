@@ -968,6 +968,18 @@ and :ref:`aiohttp-web-signals` handlers::
 
    Supports the ``Content-Range`` and ``If-Range`` HTTP Headers in requests.
 
+   A ``Range`` header requesting multiple byte ranges is answered with a
+   ``multipart/byteranges`` response where every part carries its own
+   ``Content-Type`` and ``Content-Range`` header. Overlapping or
+   adjacent ranges are merged into a single ``206`` response, ranges that
+   cannot be satisfied are dropped (``416`` if none can), and a
+   syntactically invalid ``Range`` header (or one with more than
+   :data:`~aiohttp.web_fileresponse.MAX_RANGES` items) is ignored in favor of
+   a full ``200`` response. Multi-range requests are always served from
+   the identity (uncompressed) representation.
+
+   .. versionadded:: 4.0
+
    The actual :attr:`body` sending happens in overridden :meth:`~StreamResponse.prepare`.
 
    :param path: Path to file. Accepts both :class:`str` and :class:`pathlib.Path`.
