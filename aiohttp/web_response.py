@@ -88,6 +88,7 @@ class StreamResponse(
     _must_be_empty_body: bool | None = None
     _body_length = 0
     _send_headers_immediately = True
+    _digest_trailer: bool = False
 
     def __init__(
         self,
@@ -195,6 +196,37 @@ class StreamResponse(
         self._compression = True
         self._compression_force = force
         self._compression_strategy = strategy
+
+    def enable_digest_trailer(self) -> None:
+        """Enable a SHA-256 ``Digest`` trailer for the response.
+
+        The digest is computed over the entity bytes as transferred on the
+        wire, i.e. after compression when compression is also enabled, and
+        is published in a ``Digest`` trailer (RFC 9530) after the final
+        chunk of the chunked response body.
+
+        Enabling the digest trailer implies chunked transfer encoding, so
+        it requires HTTP/1.1 and is incompatible with a fixed
+        Content-Length.  The trailer is only published if the response
+        completes successfully; if the client disconnects or a write
+        fails, no digest is sent.
+        """
+        if self.prepared:
+            raise RuntimeError(
+                "Cannot enable digest trailer after the response has been prepared"
+            )
+        if hdrs.CONTENT_LENGTH in self._headers:
+            raise RuntimeError(
+                "Digest trailer requires chunked encoding and is "
+                "incompatible with a fixed Content-Length"
+            )
+        trailer = self._headers.get(hdrs.TRAILER)
+        if trailer is not None:
+            declared = {token.strip().lower() for token in trailer.split(",")}
+            if "digest" in declared:
+                raise RuntimeError("The Trailer header already declares Digest")
+        self._chunked = True
+        self._digest_trailer = True
 
     @property
     def headers(self) -> "CIMultiDict[str]":
@@ -406,6 +438,16 @@ class StreamResponse(
                         headers[hdrs.TRANSFER_ENCODING] = "chunked"
                 elif not self._must_be_empty_body:
                     keep_alive = False
+
+        if self._digest_trailer and writer.chunked:
+            writer.enable_digest_trailer()
+            # Announce the trailer before the headers are sent, as required
+            # by RFC 9110 section 6.5.1.
+            trailer = headers.get(hdrs.TRAILER)
+            if trailer is None:
+                headers[hdrs.TRAILER] = "Digest"
+            else:
+                headers[hdrs.TRAILER] = f"{trailer}, Digest"
 
         # HTTP 1.1: https://tools.ietf.org/html/rfc7230#section-3.3.2
         # HTTP 1.0: https://tools.ietf.org/html/rfc1945#section-10.4

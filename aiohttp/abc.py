@@ -204,6 +204,7 @@ class AbstractStreamWriter(ABC):
     buffer_size: int = 0
     output_size: int = 0
     length: int | None = 0
+    chunked: bool = False
 
     @abstractmethod
     async def write(
@@ -237,6 +238,12 @@ class AbstractStreamWriter(ABC):
         """Force sending buffered headers if not already sent.
 
         Required only if write_headers() buffers headers instead of sending immediately.
+        For backwards compatibility, this method does nothing by default.
+        """
+
+    def enable_digest_trailer(self) -> None:
+        """Enable computing a SHA-256 digest published as a ``Digest`` trailer.
+
         For backwards compatibility, this method does nothing by default.
         """
 

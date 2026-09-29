@@ -414,7 +414,7 @@ on the wire. The wire-side consumer is the **untrusted** counterparty
 | 2.11 | Chunked encoding hex framing | T | Malformed chunk-size lines (negative values, leading-`+`, leading zeros, hex obfuscation) would let a non-aiohttp peer reframe the body differently and smuggle. | Low |
 | 2.12 | Header insertion validation timing | T | Forbidden-CTL rejection is *write-time*, not *insert-time*. A handler that sets a malicious header and then aborts before `write_headers()` will not raise. (Documented; not a recommended change.) | Low |
 | 2.13 | Cython ⇄ pure-Python parity | T | Divergence between the two `_serialize_headers` implementations could let one backend silently pass a forbidden CTL that the other rejects, weakening egress safety asymmetrically. | Low |
-| 2.14 | Trailers asymmetry | T | The writer never emits trailers, but the parser accepts incoming trailers; not a writer-side threat in itself, just a documentation point for completeness. | Low |
+| 2.14 | Trailers asymmetry | T | The writer emits trailers only for the opt-in ``Digest`` trailer (``StreamResponse.enable_digest_trailer()``), whose value is a base64-encoded SHA-256 computed by the server itself — no attacker-controlled bytes reach the trailer line. The parser accepts incoming trailers; not a writer-side threat in itself, just a documentation point for completeness. | Low |
 
 **Mitigations.**
 
@@ -433,7 +433,7 @@ on the wire. The wire-side consumer is the **untrusted** counterparty
 | 2.11 | Chunked hex framing | The writer always uses `f"{len(chunk):x}\r\n"` followed by the chunk and `\r\n` (`http_writer.py:StreamWriter._write_chunked_payload`). | None. |
 | 2.12 | Insert-time vs write-time validation | Headers are validated at write-time only; `set_status` validates `reason` at set-time. | Documented design decision: late validation is acceptable; keep behaviour as-is. |
 | 2.13 | Cython ⇄ pure-Python parity | Both backends share the same logic and test surface; the Cython version uses a fast per-codepoint range check (`ch < 0x20 and ch != 0x09`, plus `0x7F`), the Python version uses a precompiled `re` over the same forbidden set. | **Parameterise the writer tests over both backends so egress equivalence on malicious inputs is exercised under both (see [§6.1](#61-highest-leverage-recommendations) #3).** |
-| 2.14 | Trailers asymmetry | Writer does not emit trailers; parser accepts trailers on incoming. Documented for completeness. | None. |
+| 2.14 | Trailers asymmetry | Writer emits trailers only via the opt-in digest trailer (`web_response.py:StreamResponse.enable_digest_trailer` / `http_writer.py:StreamWriter.enable_digest_trailer`): the trailer name is the fixed string ``Digest`` and the value is ``sha-256=:<base64>:`` produced by `hashlib`/`base64`, an alphabet with no CR/LF, so no header-injection surface is added. The trailer is declared via the ``Trailer`` header before the response starts and is only emitted as part of the final `0`-chunk write, so an aborted or failed response never publishes a success digest. Parser accepts trailers on incoming. Documented for completeness. | None. |
 
 **Past advisories / hardening (recap).**
 

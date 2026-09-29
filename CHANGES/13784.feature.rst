@@ -1,0 +1,5 @@
+Added :meth:`~aiohttp.web.StreamResponse.enable_digest_trailer`, an
+opt-in SHA-256 response digest computed over the entity bytes as
+transferred (after compression, when enabled) and published in a
+``Digest`` trailer (:rfc:`9530`) at the end of HTTP/1.1 chunked
+responses -- by :user:`aiohttp-contributors`.

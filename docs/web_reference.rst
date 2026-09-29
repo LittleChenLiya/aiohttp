@@ -744,6 +744,29 @@ and :ref:`aiohttp-web-signals` handlers::
 
       .. seealso:: :attr:`chunked`
 
+   .. method:: enable_digest_trailer()
+
+      Enables computing a SHA-256 digest of the response entity and
+      publishing it in a ``Digest`` trailer (:rfc:`9530`) at the end of
+      the chunked response body.
+
+      The digest is computed over the entity bytes as transferred on the
+      wire, i.e. *after* compression when :meth:`enable_compression` is
+      also used.  The ``Trailer: Digest`` header is declared
+      automatically when the response starts; a pre-existing ``Trailer``
+      header is kept and ``Digest`` is appended to it.
+
+      The trailer is only sent if the response completes successfully:
+      if the client disconnects or a write fails, no digest is
+      published.
+
+      .. warning:: the digest trailer requires chunked encoding, which
+                   is enabled implicitly by this call, so it works with
+                   ``HTTP/1.1`` only and is mutually exclusive with a
+                   fixed :attr:`content_length`.
+
+      .. versionadded:: 4.0
+
    .. attribute:: headers
 
       :class:`~multidict.CIMultiDict` instance
