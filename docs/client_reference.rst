@@ -53,6 +53,7 @@ The client session supports the context manager protocol for self closing.
                          ssl=True, \
                          trust_env=False, \
                          requote_redirect_url=True, \
+                         redirect_policy=None, \
                          trace_configs=None, \
                          middlewares=(), \
                          read_bufsize=2**18, \
@@ -217,6 +218,17 @@ The client session supports the context manager protocol for self closing.
 
       .. versionadded:: 3.5
 
+   :param redirect_policy: An optional callable consulted every time a
+      redirect is about to be followed. It receives a
+      :class:`RedirectPolicyContext` and may allow the redirect, refuse it,
+      or allow it while dropping specific request headers. See
+      :meth:`request<aiohttp.ClientSession.request>` for the call semantics.
+      ``None`` (default) means all redirects are followed.
+      The value is used as the default for the *redirect_policy* parameter
+      of every request made by the session.
+
+      .. versionadded:: 4.0
+
    :param trace_configs: A list of :class:`TraceConfig` instances used for client
                          tracing.  ``None`` (default) is used for request tracing
                          disabling.  See :ref:`aiohttp-client-tracing-reference` for
@@ -312,6 +324,15 @@ The client session supports the context manager protocol for self closing.
 
          The attribute modification is deprecated.
 
+   .. attribute:: redirect_policy
+
+      The default redirect policy used by requests made by this session,
+      see :meth:`request<aiohttp.ClientSession.request>` for details.
+
+      A read-only property.
+
+      .. versionadded:: 4.0
+
    .. attribute:: loop
 
       A loop instance used for session creation.
@@ -401,6 +422,7 @@ The client session supports the context manager protocol for self closing.
                          cookies=None, headers=None, skip_auto_headers=None, \
                          allow_redirects=True,\
                          max_redirects=10,\
+                         redirect_policy=None,\
                          compress=None, chunked=None, expect100=False, raise_for_status=None,\
                          read_until_eof=True, \
                          proxy=None,\
@@ -484,6 +506,29 @@ The client session supports the context manager protocol for self closing.
          times out. Use ``allow_redirects=False`` to not follow redirects at all.
          Ignored when ``allow_redirects=False``.
          ``10`` by default.
+
+      :param redirect_policy: An optional callable consulted every time a
+         redirect is about to be followed, after aiohttp has applied its
+         own method rewriting and credential stripping rules and before the
+         redirected request is sent. The callable receives a
+         :class:`RedirectPolicyContext` with the original URL, the target
+         URL, the redirect status code, the number of redirects followed so
+         far and the method of the upcoming request. It may be a regular or
+         an asynchronous function and must return one of:
+
+         - ``True`` or ``None`` to allow the redirect,
+         - ``False`` to refuse it: the redirect response is returned to the
+           caller as if ``allow_redirects`` was ``False`` for this hop,
+         - a header name or an iterable of header names to allow the
+           redirect but remove those headers from the redirected request.
+
+         The policy can only drop headers, it cannot re-add credentials
+         (e.g. ``Authorization``) that aiohttp has already removed for the
+         origin change. Ignored when ``allow_redirects=False``. ``None``
+         (default) falls back to the session's
+         :attr:`ClientSession.redirect_policy`.
+
+         .. versionadded:: 4.0
 
       :param bool compress: Set to ``True`` if request has to be compressed
          with deflate encoding. If `compress` can not be combined
@@ -1071,6 +1116,39 @@ certification chaining.
                   'http://python.org/') as resp:
               assert resp.status == 200
               print(await resp.text())
+
+
+.. class:: RedirectPolicyContext
+   :canonical: aiohttp.client.RedirectPolicyContext
+
+   Details of a redirect that is about to be followed, passed to the
+   *redirect_policy* callable (see
+   :meth:`ClientSession.request<aiohttp.ClientSession.request>`) right before
+   the redirected request would be sent, after aiohttp has applied its own
+   method rewriting and credential stripping rules.
+
+   .. versionadded:: 4.0
+
+   .. attribute:: method
+
+      HTTP method of the upcoming request, after method rewriting
+      (:class:`str`).
+
+   .. attribute:: url
+
+      URL of the request that resulted in this redirect (:class:`~yarl.URL`).
+
+   .. attribute:: redirect_url
+
+      Absolute URL the redirect points to (:class:`~yarl.URL`).
+
+   .. attribute:: status
+
+      Status code of the redirect response (:class:`int`).
+
+   .. attribute:: redirects
+
+      Number of redirects followed so far, including this one (:class:`int`).
 
 
 .. _aiohttp-client-reference-connectors:

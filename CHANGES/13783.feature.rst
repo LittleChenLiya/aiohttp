@@ -1,0 +1,1 @@
+Added an optional ``redirect_policy`` to ``ClientSession`` and ``ClientSession.request()``: a callable consulted before each redirect is followed, which may allow the redirect, refuse it, or drop specific request headers from the redirected request -- by :user:`Admire`.

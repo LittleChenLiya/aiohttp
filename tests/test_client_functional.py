@@ -3732,6 +3732,342 @@ async def test_drop_session_authorization_header_on_redirect_to_other_host(
             assert resp.status == 200
 
 
+async def test_redirect_policy_allow_same_origin(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """The policy is consulted with the redirect details and may allow."""
+    contexts: list[aiohttp.RedirectPolicyContext] = []
+
+    async def srv_redirect(request: web.Request) -> NoReturn:
+        raise web.HTTPFound(server.make_url("/target"))
+
+    async def srv_target(request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/redirect", srv_redirect)
+    app.router.add_get("/target", srv_target)
+    server = await aiohttp_server(app)
+
+    def policy(ctx: aiohttp.RedirectPolicyContext) -> bool:
+        contexts.append(ctx)
+        return True
+
+    async with aiohttp.ClientSession(redirect_policy=policy) as client:
+        async with client.get(server.make_url("/redirect")) as resp:
+            assert resp.status == 200
+            assert await resp.text() == "OK"
+
+    assert len(contexts) == 1
+    ctx = contexts[0]
+    assert ctx.method == "GET"
+    assert ctx.url == server.make_url("/redirect")
+    assert ctx.redirect_url == server.make_url("/target")
+    assert ctx.status == 302
+    assert ctx.redirects == 1
+
+
+async def test_redirect_policy_deny_cross_origin(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """A denied redirect is not followed and the connection stays reusable."""
+    to_requests = 0
+    from_transports: list[asyncio.Transport | None] = []
+    contexts: list[aiohttp.RedirectPolicyContext] = []
+
+    async def srv_redirect(request: web.Request) -> NoReturn:
+        from_transports.append(request.transport)
+        raise web.HTTPFound(server_to.make_url("/target"))
+
+    async def srv_ok(request: web.Request) -> web.Response:
+        from_transports.append(request.transport)
+        return web.Response(text="OK")
+
+    async def srv_to(request: web.Request) -> web.Response:
+        nonlocal to_requests
+        to_requests += 1
+        return web.Response()
+
+    app_from = web.Application()
+    app_from.router.add_get("/redirect", srv_redirect)
+    app_from.router.add_get("/ok", srv_ok)
+    server_from = await aiohttp_server(app_from)
+
+    app_to = web.Application()
+    app_to.router.add_get("/target", srv_to)
+    server_to = await aiohttp_server(app_to)
+
+    def policy(ctx: aiohttp.RedirectPolicyContext) -> bool:
+        contexts.append(ctx)
+        # Two servers on the same host but different ports are different
+        # origins; refuse cross-origin redirects.
+        return ctx.url.origin() == ctx.redirect_url.origin()
+
+    async with aiohttp.ClientSession(redirect_policy=policy) as client:
+        async with client.get(server_from.make_url("/redirect")) as resp:
+            assert resp.status == 302
+            assert resp.history == ()
+        assert to_requests == 0, "Denied redirect was followed"
+        assert len(contexts) == 1
+        assert contexts[0].redirect_url == server_to.make_url("/target")
+        # The connection used for the denied redirect is back in the pool.
+        async with client.get(server_from.make_url("/ok")) as resp:
+            assert resp.status == 200
+            assert await resp.text() == "OK"
+
+    assert len(from_transports) == 2
+    assert (
+        len({id(transport) for transport in from_transports}) == 1
+    ), "Connection was not reused after a denied redirect"
+
+
+async def test_redirect_policy_post_302_method_rewrite(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """The policy sees the rewritten GET method for a 302 POST redirect."""
+    methods: list[str] = []
+    contexts: list[aiohttp.RedirectPolicyContext] = []
+
+    async def srv_redirect(request: web.Request) -> NoReturn:
+        raise web.HTTPFound("/target")
+
+    async def srv_target(request: web.Request) -> web.Response:
+        methods.append(request.method)
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_post("/redirect", srv_redirect)
+    app.router.add_get("/target", srv_target)
+    server = await aiohttp_server(app)
+
+    def policy(ctx: aiohttp.RedirectPolicyContext) -> bool:
+        contexts.append(ctx)
+        return True
+
+    async with aiohttp.ClientSession(redirect_policy=policy) as client:
+        async with client.post(server.make_url("/redirect"), data=b"payload") as resp:
+            assert resp.status == 200
+
+    assert methods == ["GET"]
+    assert [ctx.method for ctx in contexts] == ["GET"]
+
+
+async def test_redirect_policy_post_307_preserves_method(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """The policy sees the preserved POST method for a 307 redirect."""
+    methods: list[str] = []
+    contexts: list[aiohttp.RedirectPolicyContext] = []
+
+    async def srv_redirect(request: web.Request) -> NoReturn:
+        raise web.HTTPTemporaryRedirect("/target")
+
+    async def srv_target(request: web.Request) -> web.Response:
+        methods.append(request.method)
+        assert await request.read() == b"payload"
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_post("/redirect", srv_redirect)
+    app.router.add_post("/target", srv_target)
+    server = await aiohttp_server(app)
+
+    def policy(ctx: aiohttp.RedirectPolicyContext) -> bool:
+        contexts.append(ctx)
+        return True
+
+    async with aiohttp.ClientSession(redirect_policy=policy) as client:
+        async with client.post(server.make_url("/redirect"), data=b"payload") as resp:
+            assert resp.status == 200
+
+    assert methods == ["POST"]
+    assert [ctx.method for ctx in contexts] == ["POST"]
+
+
+async def test_redirect_policy_removes_headers(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """The policy may drop headers from the next hop, but cannot bring back
+    the Authorization header that aiohttp removed on the origin change."""
+
+    async def srv_from(request: web.Request) -> NoReturn:
+        assert request.headers["X-Secret"] == "1"
+        assert request.headers["Authorization"] == "Basic dXNlcjpwYXNz"
+        raise web.HTTPFound(server_to.make_url("/target"))
+
+    async def srv_to(request: web.Request) -> web.Response:
+        assert "X-Secret" not in request.headers, "Header wasn't dropped"
+        assert (
+            "Authorization" not in request.headers
+        ), "Policy resurrected the Authorization header"
+        return web.Response()
+
+    app_from = web.Application()
+    app_from.router.add_get("/redirect", srv_from)
+    server_from = await aiohttp_server(app_from)
+
+    app_to = web.Application()
+    app_to.router.add_get("/target", srv_to)
+    server_to = await aiohttp_server(app_to)
+
+    def policy(ctx: aiohttp.RedirectPolicyContext) -> list[str]:
+        return ["X-Secret"]
+
+    async with aiohttp.ClientSession(redirect_policy=policy) as client:
+        async with client.get(
+            server_from.make_url("/redirect"),
+            headers={
+                "X-Secret": "1",
+                "Authorization": "Basic dXNlcjpwYXNz",
+            },
+        ) as resp:
+            assert resp.status == 200
+
+
+async def test_redirect_policy_relative_location(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """A relative Location is resolved before the policy is consulted."""
+    contexts: list[aiohttp.RedirectPolicyContext] = []
+
+    async def srv_redirect(request: web.Request) -> web.Response:
+        return web.Response(status=302, headers={hdrs.LOCATION: "/target"})
+
+    async def srv_target(request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/redirect", srv_redirect)
+    app.router.add_get("/target", srv_target)
+    server = await aiohttp_server(app)
+
+    async def policy(ctx: aiohttp.RedirectPolicyContext) -> bool:
+        contexts.append(ctx)
+        return True
+
+    async with aiohttp.ClientSession(redirect_policy=policy) as client:
+        async with client.get(server.make_url("/redirect")) as resp:
+            assert resp.status == 200
+            assert await resp.text() == "OK"
+
+    assert len(contexts) == 1
+    assert contexts[0].redirect_url == server.make_url("/target")
+
+
+async def test_redirect_policy_invalid_redirect_url(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """An invalid redirect URL still raises and the policy is not consulted."""
+    contexts: list[aiohttp.RedirectPolicyContext] = []
+
+    async def srv_redirect(request: web.Request) -> web.Response:
+        return web.Response(
+            status=302,
+            headers={hdrs.LOCATION: "http://example.com:999999/path"},
+        )
+
+    app = web.Application()
+    app.router.add_get("/redirect", srv_redirect)
+    server = await aiohttp_server(app)
+
+    def policy(ctx: aiohttp.RedirectPolicyContext) -> bool:
+        contexts.append(ctx)
+        return True
+
+    async with aiohttp.ClientSession(redirect_policy=policy) as client:
+        with pytest.raises(InvalidUrlRedirectClientError):
+            await client.get(server.make_url("/redirect"))
+
+    assert not contexts
+
+
+async def test_redirect_policy_cancellation(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """Cancelling the request while the policy runs propagates cleanly."""
+    policy_started = asyncio.Event()
+
+    async def srv_redirect(request: web.Request) -> NoReturn:
+        raise web.HTTPFound("/target")
+
+    async def srv_target(request: web.Request) -> web.Response:
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_get("/redirect", srv_redirect)
+    app.router.add_get("/target", srv_target)
+    server = await aiohttp_server(app)
+
+    async def policy(ctx: aiohttp.RedirectPolicyContext) -> bool:
+        policy_started.set()
+        await asyncio.Event().wait()  # Block until cancelled
+        return True
+
+    async with aiohttp.ClientSession(redirect_policy=policy) as client:
+        task = asyncio.create_task(client.get(server.make_url("/redirect")))
+        await policy_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert client.closed
+
+
+async def test_redirect_policy_not_called_when_redirects_disabled(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """allow_redirects=False keeps the original behavior, policy untouched."""
+    called = False
+
+    async def srv_redirect(request: web.Request) -> NoReturn:
+        raise web.HTTPFound("/target")
+
+    app = web.Application()
+    app.router.add_get("/redirect", srv_redirect)
+    server = await aiohttp_server(app)
+
+    def policy(ctx: aiohttp.RedirectPolicyContext) -> bool:
+        nonlocal called
+        called = True
+        return True
+
+    async with aiohttp.ClientSession(redirect_policy=policy) as client:
+        async with client.get(
+            server.make_url("/redirect"), allow_redirects=False
+        ) as resp:
+            assert resp.status == 302
+
+    assert not called
+
+
+async def test_redirect_policy_per_request_overrides_session(
+    aiohttp_server: AiohttpServer,
+) -> None:
+    """A per-request policy takes precedence over the session default."""
+
+    async def srv_redirect(request: web.Request) -> NoReturn:
+        raise web.HTTPFound("/target")
+
+    async def srv_target(request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/redirect", srv_redirect)
+    app.router.add_get("/target", srv_target)
+    server = await aiohttp_server(app)
+
+    async with aiohttp.ClientSession(redirect_policy=lambda ctx: False) as client:
+        # The session-level policy denies the redirect.
+        async with client.get(server.make_url("/redirect")) as resp:
+            assert resp.status == 302
+        # The per-request policy overrides it and allows the redirect.
+        async with client.get(
+            server.make_url("/redirect"), redirect_policy=lambda ctx: True
+        ) as resp:
+            assert resp.status == 200
+            assert await resp.text() == "OK"
+
+
 async def test_async_with_session() -> None:
     async with aiohttp.ClientSession() as session:
         pass

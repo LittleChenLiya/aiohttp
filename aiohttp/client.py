@@ -27,6 +27,7 @@ from typing import (
     Literal,
     TypedDict,
     TypeVar,
+    Union,
     final,
     overload,
 )
@@ -154,6 +155,7 @@ __all__ = (
     "ClientSession",
     "ClientTimeout",
     "ClientWSTimeout",
+    "RedirectPolicyContext",
     "request",
     "WSMessageTypeError",
 )
@@ -194,6 +196,7 @@ class _RequestOptions(TypedDict, total=False):
     max_field_size: int | None
     max_headers: int | None
     middlewares: Sequence[ClientMiddlewareType] | None
+    redirect_policy: "RedirectPolicy | None"
 
 
 class _WSConnectOptions(TypedDict, total=False):
@@ -213,6 +216,44 @@ class _WSConnectOptions(TypedDict, total=False):
     proxy_headers: LooseHeaders | None
     compress: int
     max_msg_size: int
+
+
+@dataclasses.dataclass(frozen=True)
+class RedirectPolicyContext:
+    """Details of a redirect that is about to be followed.
+
+    An instance is passed to the ``redirect_policy`` callable (see
+    :meth:`ClientSession.request`) right before the redirected request
+    would be sent, after aiohttp has applied its own method rewriting
+    and credential stripping rules.
+    """
+
+    method: str
+    """HTTP method of the upcoming request, after method rewriting."""
+
+    url: URL
+    """URL of the request that resulted in this redirect."""
+
+    redirect_url: URL
+    """Absolute URL the redirect points to."""
+
+    status: int
+    """Status code of the redirect response."""
+
+    redirects: int
+    """Number of redirects followed so far, including this one."""
+
+
+# Result of a redirect policy call: True/None allows the redirect, False
+# refuses it (the redirect response is returned to the caller), a header
+# name or an iterable of header names allows the redirect but removes the
+# given headers from the redirected request. Policies can only drop
+# headers, they cannot re-add credentials aiohttp has already removed.
+RedirectPolicyResult = Union[bool, str, Iterable[str], None]
+RedirectPolicy = Callable[
+    [RedirectPolicyContext],
+    Union[RedirectPolicyResult, Awaitable[RedirectPolicyResult]],
+]
 
 
 # https://www.rfc-editor.org/rfc/rfc9110#section-9.2.2
@@ -270,6 +311,7 @@ class ClientSession:
         "_json_serialize",
         "_json_serialize_bytes",
         "_requote_redirect_url",
+        "_redirect_policy",
         "_timeout",
         "_raise_for_status",
         "_auto_decompress",
@@ -314,6 +356,7 @@ class ClientSession:
         auto_decompress: bool = True,
         trust_env: bool = False,
         requote_redirect_url: bool = True,
+        redirect_policy: RedirectPolicy | None = None,
         trace_configs: list[TraceConfig[object]] | None = None,
         read_bufsize: int = DEFAULT_CHUNK_SIZE,
         max_line_size: int = 8190,
@@ -391,6 +434,7 @@ class ClientSession:
         self._auto_decompress = auto_decompress
         self._trust_env = trust_env
         self._requote_redirect_url = requote_redirect_url
+        self._redirect_policy = redirect_policy
         self._read_bufsize = read_bufsize
         self._max_line_size = max_line_size
         self._max_field_size = max_field_size
@@ -475,6 +519,7 @@ class ClientSession:
         skip_auto_headers: Iterable[str] | None = None,
         allow_redirects: bool = True,
         max_redirects: int = 10,
+        redirect_policy: RedirectPolicy | None = None,
         compress: Literal["deflate", "gzip"] | bool = False,
         chunked: bool | None = None,
         expect100: bool = False,
@@ -587,6 +632,9 @@ class ClientSession:
 
         if max_headers is None:
             max_headers = self._max_headers
+
+        if redirect_policy is None:
+            redirect_policy = self._redirect_policy
 
         traces = [
             Trace(
@@ -852,6 +900,35 @@ class ClientSession:
                             headers.popall(hdrs.AUTHORIZATION, None)
                             headers.popall(hdrs.COOKIE, None)
                             headers.popall(hdrs.PROXY_AUTHORIZATION, None)
+
+                        if redirect_policy is not None:
+                            # Consult the policy after the method rewrite and
+                            # credential cleanup above, right before the next
+                            # hop is sent. The policy may only drop headers,
+                            # so it cannot re-add credentials (e.g.
+                            # Authorization) that were already removed.
+                            policy_result = redirect_policy(
+                                RedirectPolicyContext(
+                                    method=method,
+                                    url=url.update_query(params),
+                                    redirect_url=parsed_redirect_url,
+                                    status=resp.status,
+                                    redirects=redirects,
+                                )
+                            )
+                            if isinstance(policy_result, Awaitable):
+                                policy_result = await policy_result
+                            if policy_result is False:
+                                # The policy refused the redirect: stop
+                                # following and return the redirect response.
+                                history.pop()
+                                break
+                            if policy_result is not None and policy_result is not True:
+                                if isinstance(policy_result, str):
+                                    headers.popall(policy_result, None)
+                                else:
+                                    for header_name in policy_result:
+                                        headers.popall(header_name, None)
 
                         url = parsed_redirect_url
                         params = {}
@@ -1396,6 +1473,11 @@ class ClientSession:
     def requote_redirect_url(self) -> bool:
         """Do URL requoting on redirection handling."""
         return self._requote_redirect_url
+
+    @property
+    def redirect_policy(self) -> RedirectPolicy | None:
+        """Default redirect policy used by requests made by this session."""
+        return self._redirect_policy
 
     @property
     def timeout(self) -> ClientTimeout:
