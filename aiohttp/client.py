@@ -154,6 +154,9 @@ __all__ = (
     "ClientSession",
     "ClientTimeout",
     "ClientWSTimeout",
+    "RedirectDecision",
+    "RedirectInfo",
+    "RedirectPolicy",
     "request",
     "WSMessageTypeError",
 )
@@ -177,6 +180,7 @@ class _RequestOptions(TypedDict, total=False):
     skip_auto_headers: Iterable[str] | None
     allow_redirects: bool
     max_redirects: int
+    redirect_policy: "RedirectPolicy | _SENTINEL | None"
     compress: Literal["deflate", "gzip"] | bool
     chunked: bool | None
     expect100: bool
@@ -220,6 +224,36 @@ class _WSConnectOptions(TypedDict, total=False):
 IDEMPOTENT_METHODS = frozenset(
     {"GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE", "QUERY"}
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class RedirectInfo:
+    """Describes a redirect that the client is about to follow.
+
+    Passed to the redirect_policy callable before the next hop is sent.
+    """
+
+    from_url: URL
+    to_url: URL
+    status: int
+    redirect_count: int
+    method: str
+
+
+@dataclasses.dataclass(frozen=True)
+class RedirectDecision:
+    """Decision returned by a redirect_policy callable.
+
+    The policy may allow the redirect (optionally stripping request
+    headers from the next hop) or deny it, in which case the redirect
+    response is returned to the caller as the final response.
+    """
+
+    allow: bool = True
+    strip_headers: tuple[str, ...] = ()
+
+
+RedirectPolicy = Callable[[RedirectInfo], "RedirectDecision | None"]
 
 _RetType_co = TypeVar(
     "_RetType_co",
@@ -289,6 +323,7 @@ class ClientSession:
         "_default_ssl",
         "_retry_connection",
         "_middlewares",
+        "_redirect_policy",
     )
 
     def __init__(
@@ -322,6 +357,7 @@ class ClientSession:
         fallback_charset_resolver: _CharsetResolver = lambda r, b: "utf-8",
         middlewares: Sequence[ClientMiddlewareType] = (),
         ssl_shutdown_timeout: _SENTINEL | None | float = sentinel,
+        redirect_policy: RedirectPolicy | None = None,
     ) -> None:
         # We initialise _connector to None immediately, as it's referenced in __del__()
         # and could cause issues if an exception occurs during initialisation.
@@ -421,6 +457,7 @@ class ClientSession:
         self._default_ssl = ssl
         self._retry_connection: bool = True
         self._middlewares = tuple(middlewares)
+        self._redirect_policy = redirect_policy
 
     def __init_subclass__(cls: type["ClientSession"]) -> None:
         raise TypeError(
@@ -475,6 +512,7 @@ class ClientSession:
         skip_auto_headers: Iterable[str] | None = None,
         allow_redirects: bool = True,
         max_redirects: int = 10,
+        redirect_policy: RedirectPolicy | _SENTINEL | None = sentinel,
         compress: Literal["deflate", "gzip"] | bool = False,
         chunked: bool | None = None,
         expect100: bool = False,
@@ -587,6 +625,9 @@ class ClientSession:
 
         if max_headers is None:
             max_headers = self._max_headers
+
+        if redirect_policy is sentinel:
+            redirect_policy = self._redirect_policy
 
         traces = [
             Trace(
@@ -852,6 +893,30 @@ class ClientSession:
                             headers.popall(hdrs.AUTHORIZATION, None)
                             headers.popall(hdrs.COOKIE, None)
                             headers.popall(hdrs.PROXY_AUTHORIZATION, None)
+
+                        if redirect_policy is not None:
+                            # The policy runs after the library's own method
+                            # rewriting and cross-origin auth stripping, and
+                            # can only remove headers -- never re-add ones the
+                            # library has already dropped (e.g. Authorization).
+                            decision = redirect_policy(
+                                RedirectInfo(
+                                    from_url=url,
+                                    to_url=parsed_redirect_url,
+                                    status=resp.status,
+                                    redirect_count=redirects,
+                                    method=method,
+                                )
+                            )
+                            if decision is None:
+                                decision = RedirectDecision()
+                            for header_name in decision.strip_headers:
+                                headers.popall(istr(header_name), None)
+                            if not decision.allow:
+                                # The redirect response becomes the final
+                                # response; it is not part of the history.
+                                history.pop()
+                                break
 
                         url = parsed_redirect_url
                         params = {}

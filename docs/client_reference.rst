@@ -60,7 +60,8 @@ The client session supports the context manager protocol for self closing.
                          max_field_size=8190, \
                          max_headers=128, \
                          fallback_charset_resolver=lambda r, b: "utf-8", \
-                         ssl_shutdown_timeout=0)
+                         ssl_shutdown_timeout=0, \
+                         redirect_policy=None)
    :canonical: aiohttp.client.ClientSession
 
    The class for creating client sessions and making requests.
@@ -228,6 +229,17 @@ The client session supports the context manager protocol for self closing.
                       See :ref:`aiohttp-client-middleware` for more information.
 
       .. versionadded:: 3.12
+
+   :param redirect_policy: An optional callable invoked before each redirect
+                      hop is sent for every request made by this session.
+                      It receives a :class:`RedirectInfo` and must return a
+                      :class:`RedirectDecision` (or ``None`` to allow the
+                      redirect unchanged). May be overridden per request with
+                      the ``redirect_policy`` parameter of
+                      :meth:`request<aiohttp.ClientSession.request>`.
+                      ``None`` (default) means redirects are always followed.
+
+      .. versionadded:: 4.0
 
    :param int read_bufsize: Size of the read buffer (:attr:`ClientResponse.content`).
                             256 KiB by default. On a WebSocket connection it
@@ -401,6 +413,7 @@ The client session supports the context manager protocol for self closing.
                          cookies=None, headers=None, skip_auto_headers=None, \
                          allow_redirects=True,\
                          max_redirects=10,\
+                         redirect_policy=None,\
                          compress=None, chunked=None, expect100=False, raise_for_status=None,\
                          read_until_eof=True, \
                          proxy=None,\
@@ -484,6 +497,17 @@ The client session supports the context manager protocol for self closing.
          times out. Use ``allow_redirects=False`` to not follow redirects at all.
          Ignored when ``allow_redirects=False``.
          ``10`` by default.
+
+      :param redirect_policy: An optional callable invoked before each
+         redirect hop is sent. It receives a :class:`RedirectInfo` and must
+         return a :class:`RedirectDecision` (or ``None`` to allow the
+         redirect unchanged). The policy may allow the redirect, deny it
+         (the redirect response is returned as the final response), or
+         strip selected request headers from the next hop. Overrides the
+         session-level ``redirect_policy``. Ignored when
+         ``allow_redirects=False``.
+
+         .. versionadded:: 4.0
 
       :param bool compress: Set to ``True`` if request has to be compressed
          with deflate encoding. If `compress` can not be combined
@@ -2211,6 +2235,57 @@ ClientRequest
 
 Utilities
 ---------
+
+
+.. class:: RedirectInfo
+   :canonical: aiohttp.client.RedirectInfo
+
+   A data class describing a redirect that the client is about to follow,
+   passed to the ``redirect_policy`` callable before the next hop is sent.
+
+   .. versionadded:: 4.0
+
+   .. attribute:: from_url
+
+      The :class:`~yarl.URL` that produced the redirect response.
+
+   .. attribute:: to_url
+
+      The absolute :class:`~yarl.URL` of the next hop.
+
+   .. attribute:: status
+
+      The status code of the redirect response (301, 302, 303, 307 or 308),
+      :class:`int`.
+
+   .. attribute:: redirect_count
+
+      The 1-based number of the hop about to be taken, :class:`int`.
+
+   .. attribute:: method
+
+      The method of the upcoming request, after method rewriting
+      (e.g. ``POST`` becomes ``GET`` on a 302 redirect), :class:`str`.
+
+
+.. class:: RedirectDecision(*, allow=True, strip_headers=())
+   :canonical: aiohttp.client.RedirectDecision
+
+   A data class returned by a ``redirect_policy`` callable to control
+   whether a redirect is followed.
+
+   .. versionadded:: 4.0
+
+   .. attribute:: allow
+
+      Whether to follow the redirect, :class:`bool` (``True`` by default).
+      When ``False``, the redirect response is returned to the caller as
+      the final response.
+
+   .. attribute:: strip_headers
+
+      Request headers to remove before sending the next hop,
+      a tuple of :class:`str` (empty by default).
 
 
 .. class:: ClientTimeout(*, total=5*60, connect=None, \

@@ -1,0 +1,7 @@
+Added an optional ``redirect_policy`` hook to :class:`aiohttp.ClientSession`
+and :meth:`aiohttp.ClientSession.request`, invoked before each redirect hop
+is sent with a :class:`aiohttp.RedirectInfo` (original URL, target URL,
+status code, hop number and next-hop method); the policy returns a
+:class:`aiohttp.RedirectDecision` to allow the redirect, deny it (the
+redirect response becomes the final response), or strip selected request
+headers from the next hop -- by :user:`codex`.

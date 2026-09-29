@@ -743,3 +743,35 @@ boundary at which user-supplied strings can become wire bytes.
   urlencoded bodies (threat 4.2).
 
 These are all currently in place; this section assumes no regression.
+
+---
+
+### 5.8. Client redirect policy
+
+**Scope.** The optional ``redirect_policy`` hook on ``ClientSession`` /
+``ClientSession._request`` (`client.py`), invoked before each redirect hop
+is sent. The policy receives a ``RedirectInfo`` (``from_url``, ``to_url``,
+``status``, ``redirect_count``, ``method``) and returns a
+``RedirectDecision`` (``allow``, ``strip_headers``).
+
+**Trust boundaries & data flow.** The redirect target URL is
+server-controlled (untrusted); the policy is user code (trusted). The hook
+runs *after* the library's own method rewriting (301/302 POST -> GET) and
+cross-origin credential stripping (``Authorization``, ``Cookie``,
+``Proxy-Authorization``), and its decision can only *remove* headers --
+there is no API for the policy to add headers back, so credentials dropped
+on an origin change cannot be resurrected through the hook.
+
+**Threats (STRIDE).**
+
+| # | Component / Vector | STRIDE | Threat | Risk |
+| :--- | :--- | :--- | :--- | :--- |
+| 8.1 | Policy sees pre-redirect state | I | ``RedirectInfo`` exposes the origin and target URLs plus the next-hop method to user code; no headers or credentials are exposed, so the hook itself cannot leak secrets into logs unless user code adds them. | Low |
+| 8.2 | Denied redirect connection reuse | D | A denied redirect returns the 3xx response as final; the response is released before the policy runs, so the connection returns to the pool and cannot be wedged by a deny decision. | Low |
+
+**Mitigations.**
+
+| # | Threat | Existing | Recommended |
+| :--- | :--- | :--- | :--- |
+| 8.1 | Credential re-introduction | The decision type only supports ``strip_headers``; header mutation happens via ``headers.popall`` after the library's own stripping. | None. |
+| 8.2 | Deny-path pool hygiene | ``resp.release()`` runs before the policy is consulted; covered by ``tests/test_client_redirect_policy.py``. | None. |
