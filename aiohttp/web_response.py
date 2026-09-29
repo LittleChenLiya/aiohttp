@@ -82,6 +82,7 @@ class StreamResponse(
     _compression: bool = False
     _compression_strategy: int | None = None
     _compression_force: ContentCoding | None = None
+    _digest: bool = False
     _req: Optional["BaseRequest"] = None
     _payload_writer: AbstractStreamWriter | None = None
     _eof_sent: bool = False
@@ -195,6 +196,31 @@ class StreamResponse(
         self._compression = True
         self._compression_force = force
         self._compression_strategy = strategy
+
+    def enable_digest(self) -> None:
+        """Enable a SHA-256 Digest trailer over the transferred entity.
+
+        The digest is computed from the final entity bytes written to the
+        wire, i.e. after content codings such as compression have been
+        applied, and is sent in a ``Digest`` trailer of the chunked
+        response. A ``Trailer: Digest`` header is announced before the
+        body is sent.
+        """
+        if self._digest:
+            raise RuntimeError("Digest trailer has already been enabled")
+        if hdrs.CONTENT_LENGTH in self._headers:
+            raise RuntimeError(
+                "Digest trailer requires chunked encoding and is incompatible "
+                "with Content-Length"
+            )
+        if hdrs.TRAILER in self._headers:
+            raise RuntimeError(
+                "Cannot enable the Digest trailer when a Trailer header is "
+                "already present"
+            )
+        self._digest = True
+        self.enable_chunked_encoding()
+        self._headers[hdrs.TRAILER] = hdrs.DIGEST
 
     @property
     def headers(self) -> "CIMultiDict[str]":
@@ -418,6 +444,16 @@ class StreamResponse(
             # https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-13
             if hdrs.TRANSFER_ENCODING in headers:
                 del headers[hdrs.TRANSFER_ENCODING]
+            if self._digest:
+                raise RuntimeError(
+                    "Digest trailer is only supported for responses with a body"
+                )
+        elif self._digest:
+            if not writer.chunked:
+                raise RuntimeError(
+                    "Digest trailer is only supported with chunked HTTP/1.1 encoding"
+                )
+            writer.enable_digest()
         elif (writer.length if self._length_check else self.content_length) != 0:
             # https://www.rfc-editor.org/rfc/rfc9110#section-8.3-5
             headers.setdefault(hdrs.CONTENT_TYPE, "application/octet-stream")
@@ -700,7 +736,7 @@ class Response(StreamResponse):
             await super().write_eof(cast(bytes, body))
 
     async def _start(self, request: "BaseRequest") -> AbstractStreamWriter:
-        if hdrs.CONTENT_LENGTH in self._headers:
+        if hdrs.CONTENT_LENGTH in self._headers and not self._digest:
             if should_remove_content_length(request.method, self.status):
                 del self._headers[hdrs.CONTENT_LENGTH]
         elif not self._chunked:

@@ -229,6 +229,13 @@ class AbstractStreamWriter(ABC):
     def enable_chunking(self) -> None:
         """Enable HTTP chunked mode"""
 
+    def enable_digest(self) -> None:
+        """Enable the SHA-256 Digest trailer over the transferred entity.
+
+        Optional: writers that do not support chunked trailers may leave
+        this unimplemented.
+        """
+
     @abstractmethod
     async def write_headers(self, status_line: str, headers: CIMultiDict[str]) -> None:
         """Write HTTP headers"""

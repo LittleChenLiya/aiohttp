@@ -414,7 +414,7 @@ on the wire. The wire-side consumer is the **untrusted** counterparty
 | 2.11 | Chunked encoding hex framing | T | Malformed chunk-size lines (negative values, leading-`+`, leading zeros, hex obfuscation) would let a non-aiohttp peer reframe the body differently and smuggle. | Low |
 | 2.12 | Header insertion validation timing | T | Forbidden-CTL rejection is *write-time*, not *insert-time*. A handler that sets a malicious header and then aborts before `write_headers()` will not raise. (Documented; not a recommended change.) | Low |
 | 2.13 | Cython ⇄ pure-Python parity | T | Divergence between the two `_serialize_headers` implementations could let one backend silently pass a forbidden CTL that the other rejects, weakening egress safety asymmetrically. | Low |
-| 2.14 | Trailers asymmetry | T | The writer never emits trailers, but the parser accepts incoming trailers; not a writer-side threat in itself, just a documentation point for completeness. | Low |
+| 2.14 | Trailers asymmetry | T | The parser accepts incoming trailers, and the server writer can now emit a `Digest` trailer (`StreamResponse.enable_digest()`, `StreamWriter.enable_digest()`). The trailer field name/value are framework-generated, but a digest over a partial entity would mislead intermediaries, and TE/CL framing around trailers must stay consistent. | Low |
 
 **Mitigations.**
 
@@ -433,7 +433,7 @@ on the wire. The wire-side consumer is the **untrusted** counterparty
 | 2.11 | Chunked hex framing | The writer always uses `f"{len(chunk):x}\r\n"` followed by the chunk and `\r\n` (`http_writer.py:StreamWriter._write_chunked_payload`). | None. |
 | 2.12 | Insert-time vs write-time validation | Headers are validated at write-time only; `set_status` validates `reason` at set-time. | Documented design decision: late validation is acceptable; keep behaviour as-is. |
 | 2.13 | Cython ⇄ pure-Python parity | Both backends share the same logic and test surface; the Cython version uses a fast per-codepoint range check (`ch < 0x20 and ch != 0x09`, plus `0x7F`), the Python version uses a precompiled `re` over the same forbidden set. | **Parameterise the writer tests over both backends so egress equivalence on malicious inputs is exercised under both (see [§6.1](#61-highest-leverage-recommendations) #3).** |
-| 2.14 | Trailers asymmetry | Writer does not emit trailers; parser accepts trailers on incoming. Documented for completeness. | None. |
+| 2.14 | Trailers asymmetry | The parser accepts incoming trailers. The server writer emits trailers only through the opt-in `StreamResponse.enable_digest()` path: it forces HTTP/1.1 chunked encoding, announces `Trailer: Digest` before the body, hashes the *post-content-coding* entity bytes (`hashlib.sha256`, Base64 per RFC 9530), and refuses to start for HTTP/1.0, HEAD, or empty-body status codes. Any exception while streaming (`write` / `write_eof` / `set_eof`, including drain failures after a client abort) drops the in-progress digest, so a success `Digest` trailer cannot be published for a partial/failed entity. The trailer name/value are constants (no user-controlled bytes), so header-injection rules do not apply to the trailer itself. | Keep the trailer surface closed: new outbound trailers must be framework-generated and must apply the same "announce in `Trailer`, emit only after a fully successful chunked entity" discipline. Cross-reference [§5.5](#55-compression-codecs): hashing happens after compression. |
 
 **Past advisories / hardening (recap).**
 
@@ -451,6 +451,14 @@ on the wire. The wire-side consumer is the **untrusted** counterparty
   `0x7F`) could be emitted on the wire if a handler placed them into a
   header. Tightened `_safe_header` and `_write_str_raise_on_nlcr` to
   reject the full forbidden set (threat 2.1).
+
+- **Outbound `Digest` trailer (feature hardening)** — `StreamResponse.enable_digest()`
+  was verified to (a) only operate on HTTP/1.1 chunked responses with a
+  non-empty body (rejecting HTTP/1.0, HEAD, 1xx/204/304 and any pre-set
+  `Trailer` header or `Content-Length`), (b) hash the final on-the-wire
+  entity bytes *after* gzip/deflate, and (c) invalidate the digest on any
+  streaming/`write_eof` failure or peer abort so no trailer is published
+  for a partial entity (threat 2.14).
 
 Writer-level forbidden-CTL rejection via `_safe_header` and
 `_write_str_raise_on_nlcr` has been in place since the header-injection

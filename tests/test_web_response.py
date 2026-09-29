@@ -1677,3 +1677,91 @@ async def test_response_buffers_headers() -> None:
 
     # But write_headers should have been called
     writer.write_headers.assert_called_once()
+
+
+def test_enable_digest_sets_chunked_and_trailer_header() -> None:
+    resp = web.StreamResponse()
+    resp.enable_digest()
+    assert resp.chunked is True
+    assert resp.headers[hdrs.TRAILER] == "Digest"
+
+
+def test_enable_digest_twice_raises() -> None:
+    resp = web.StreamResponse()
+    resp.enable_digest()
+    with pytest.raises(RuntimeError, match="already been enabled"):
+        resp.enable_digest()
+
+
+def test_enable_digest_conflicts_with_content_length() -> None:
+    resp = web.StreamResponse()
+    resp.content_length = 10
+    with pytest.raises(RuntimeError, match="Content-Length"):
+        resp.enable_digest()
+
+
+def test_enable_digest_conflicts_with_existing_trailer() -> None:
+    resp = web.StreamResponse(headers={hdrs.TRAILER: "Expires"})
+    with pytest.raises(RuntimeError, match="Trailer header"):
+        resp.enable_digest()
+
+
+async def test_enable_digest_prepare_enables_writer_digest() -> None:
+    writer = mock.create_autospec(StreamWriter, spec_set=True, instance=True)
+    writer.chunked = True
+    req = make_request("GET", "/", writer=writer)
+    resp = web.StreamResponse()
+    resp.enable_digest()
+    await resp.prepare(req)
+    writer.enable_digest.assert_called_once_with()
+
+
+async def test_enable_digest_rejected_for_http10() -> None:
+    writer = mock.create_autospec(StreamWriter, spec_set=True, instance=True)
+    req = make_request("GET", "/", version=HttpVersion10, writer=writer)
+    resp = web.StreamResponse()
+    resp.enable_digest()
+    with pytest.raises(RuntimeError, match="chunked encoding is forbidden"):
+        await resp.prepare(req)
+    writer.enable_digest.assert_not_called()
+
+
+async def test_enable_digest_rejected_for_head_request() -> None:
+    writer = mock.create_autospec(StreamWriter, spec_set=True, instance=True)
+    req = make_request("HEAD", "/", writer=writer)
+    resp = web.StreamResponse()
+    resp.enable_digest()
+    with pytest.raises(RuntimeError, match="only supported for responses"):
+        await resp.prepare(req)
+    writer.enable_digest.assert_not_called()
+
+
+@pytest.mark.parametrize("status", (204, 304))
+async def test_enable_digest_rejected_for_empty_body_status(status: int) -> None:
+    writer = mock.create_autospec(StreamWriter, spec_set=True, instance=True)
+    req = make_request("GET", "/", writer=writer)
+    resp = web.StreamResponse(status=status)
+    resp.enable_digest()
+    with pytest.raises(RuntimeError, match="only supported for responses"):
+        await resp.prepare(req)
+    writer.enable_digest.assert_not_called()
+
+
+async def test_enable_digest_response_body_uses_chunking() -> None:
+    writer = mock.create_autospec(StreamWriter, spec_set=True, instance=True)
+    captured: dict[str, CIMultiDict[str]] = {}
+
+    async def write_headers(status_line: str, headers: CIMultiDict[str]) -> None:
+        captured["headers"] = CIMultiDict(headers)
+
+    writer.write_headers.side_effect = write_headers
+    writer.chunked = True
+    req = make_request("GET", "/", writer=writer)
+    resp = web.Response(body=b"answer")
+    resp.enable_digest()
+    await resp.prepare(req)
+    headers = captured["headers"]
+    assert hdrs.CONTENT_LENGTH not in headers
+    assert headers[hdrs.TRANSFER_ENCODING] == "chunked"
+    assert headers[hdrs.TRAILER] == "Digest"
+    writer.enable_digest.assert_called_once_with()

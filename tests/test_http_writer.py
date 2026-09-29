@@ -1,6 +1,9 @@
 # Tests for aiohttp/http_writer.py
 import array
 import asyncio
+import base64
+import gzip
+import hashlib
 import zlib
 from collections.abc import Generator, Iterable
 from typing import Any
@@ -1595,3 +1598,154 @@ async def test_send_headers_with_payload_chunked_eof_no_data(
     assert b"GET /test HTTP/1.1\r\n" in buf
     assert b"Transfer-Encoding: chunked\r\n" in buf
     assert buf.endswith(b"0\r\n\r\n")
+
+
+def _decode_chunked_with_trailer(
+    data: bytes,
+) -> tuple[bytes, dict[str, str]]:
+    i = data.index(b"\r\n\r\n") + 4
+    entity = b""
+    while True:
+        j = data.index(b"\r\n", i)
+        size = int(data[i:j], 16)
+        i = j + 2
+        if size == 0:
+            end = data.index(b"\r\n\r\n", i)
+            trailer_lines = data[i:end].split(b"\r\n")
+            break
+        entity += data[i : i + size]
+        i += size + 2
+    trailers: dict[str, str] = {}
+    for line in trailer_lines:
+        name, _, value = line.partition(b":")
+        trailers[name.decode().strip()] = value.decode().strip()
+    return entity, trailers
+
+
+async def test_enable_digest_emits_sha256_trailer(
+    buf: bytearray, protocol: BaseProtocol, transport: asyncio.Transport
+) -> None:
+    msg = http.StreamWriter(protocol, asyncio.get_running_loop())
+    assert msg.chunked is False
+    msg.enable_digest()
+    assert msg.chunked is True
+    headers = CIMultiDict({"Transfer-Encoding": "chunked"})
+    await msg.write_headers("HTTP/1.1 200 OK", headers)
+    await msg.write(b"hello", drain=False)
+    await msg.write(b" world", drain=False)
+    await msg.write_eof()
+
+    entity, trailers = _decode_chunked_with_trailer(bytes(buf))
+    assert entity == b"hello world"
+    expected = base64.b64encode(hashlib.sha256(b"hello world").digest()).decode()
+    assert trailers["Digest"] == f"sha-256=:{expected}:"
+
+
+async def test_digest_trailer_empty_stream(
+    buf: bytearray, protocol: BaseProtocol, transport: asyncio.Transport
+) -> None:
+    msg = http.StreamWriter(protocol, asyncio.get_running_loop())
+    msg.enable_digest()
+    headers = CIMultiDict({"Transfer-Encoding": "chunked"})
+    await msg.write_headers("HTTP/1.1 200 OK", headers)
+    await msg.write_eof()
+
+    entity, trailers = _decode_chunked_with_trailer(bytes(buf))
+    assert entity == b""
+    expected = base64.b64encode(hashlib.sha256(b"").digest()).decode()
+    assert trailers["Digest"] == f"sha-256=:{expected}:"
+
+
+async def test_digest_trailer_covers_compressed_bytes(
+    buf: bytearray, protocol: BaseProtocol, transport: asyncio.Transport
+) -> None:
+    msg = http.StreamWriter(protocol, asyncio.get_running_loop())
+    msg.enable_compression("gzip")
+    msg.enable_digest()
+    headers = CIMultiDict({"Transfer-Encoding": "chunked", "Content-Encoding": "gzip"})
+    await msg.write_headers("HTTP/1.1 200 OK", headers)
+    await msg.write(b"some text" * 1000, drain=False)
+    await msg.write_eof()
+
+    entity, trailers = _decode_chunked_with_trailer(bytes(buf))
+    expected = base64.b64encode(hashlib.sha256(entity).digest()).decode()
+    assert trailers["Digest"] == f"sha-256=:{expected}:"
+    assert gzip.decompress(entity) == b"some text" * 1000
+
+
+async def test_digest_trailer_when_compression_only_emits_on_flush(
+    buf: bytearray, protocol: BaseProtocol, transport: asyncio.Transport
+) -> None:
+    msg = http.StreamWriter(protocol, asyncio.get_running_loop())
+    msg.enable_compression("gzip")
+    msg.enable_digest()
+    headers = CIMultiDict({"Transfer-Encoding": "chunked", "Content-Encoding": "gzip"})
+    await msg.write_headers("HTTP/1.1 200 OK", headers)
+    # The first write produces no compressed output; the entity only
+    # materialises in the compressor flush inside write_eof().
+    await msg.write(b"", drain=False)
+    await msg.write_eof(b"abc")
+
+    entity, trailers = _decode_chunked_with_trailer(bytes(buf))
+    expected = base64.b64encode(hashlib.sha256(entity).digest()).decode()
+    assert trailers["Digest"] == f"sha-256=:{expected}:"
+    assert gzip.decompress(entity) == b"abc"
+
+
+async def test_digest_trailer_invalidated_on_write_failure(
+    buf: bytearray, protocol: BaseProtocol, transport: asyncio.Transport
+) -> None:
+    msg = http.StreamWriter(protocol, asyncio.get_running_loop())
+    msg.enable_digest()
+    headers = CIMultiDict({"Transfer-Encoding": "chunked"})
+    await msg.write_headers("HTTP/1.1 200 OK", headers)
+    await msg.write(b"before failure", drain=False)
+    assert msg._digest is not None
+
+    transport.write.side_effect = ConnectionResetError("boom")
+    transport.writelines.side_effect = ConnectionResetError("boom")
+    with pytest.raises(ConnectionResetError):
+        await msg.write(b"after failure", drain=False)
+    assert msg._digest is None
+
+    # Even if EOF is attempted afterwards, no Digest trailer is produced.
+    def write(chunk: bytes) -> None:
+        buf.extend(chunk)
+
+    def writelines(chunks: Iterable[bytes]) -> None:
+        for piece in chunks:
+            buf.extend(piece)
+
+    transport.write.side_effect = write
+    transport.writelines.side_effect = writelines
+    await msg.write_eof(b"tail")
+    assert b"Digest:" not in bytes(buf)
+    assert bytes(buf).endswith(b"0\r\n\r\n")
+
+
+async def test_digest_trailer_invalidated_when_eof_write_fails(
+    buf: bytearray, protocol: BaseProtocol, transport: asyncio.Transport
+) -> None:
+    msg = http.StreamWriter(protocol, asyncio.get_running_loop())
+    msg.enable_digest()
+    headers = CIMultiDict({"Transfer-Encoding": "chunked"})
+    await msg.write_headers("HTTP/1.1 200 OK", headers)
+    transport.write.side_effect = ConnectionResetError("boom")
+    with pytest.raises(ConnectionResetError):
+        await msg.write_eof(b"final")
+    assert msg._digest is None
+    assert b"Digest:" not in bytes(buf)
+
+
+async def test_write_eof_is_idempotent(
+    buf: bytearray, protocol: BaseProtocol, transport: asyncio.Transport
+) -> None:
+    msg = http.StreamWriter(protocol, asyncio.get_running_loop())
+    msg.enable_digest()
+    headers = CIMultiDict({"Transfer-Encoding": "chunked"})
+    await msg.write_headers("HTTP/1.1 200 OK", headers)
+    await msg.write_eof(b"payload")
+    captured = bytes(buf)
+    await msg.write_eof(b"ignored")
+    assert bytes(buf) == captured
+    assert bytes(buf).count(b"Digest:") == 1

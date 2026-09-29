@@ -1,0 +1,4 @@
+Added :meth:`aiohttp.web.StreamResponse.enable_digest` to publish a SHA-256
+``Digest`` trailer for chunked HTTP/1.1 responses; the digest is computed
+over the final transmitted entity bytes (after compression) and is never
+emitted if the response transfer fails or is interrupted -- by :user:`webknjaz`.
