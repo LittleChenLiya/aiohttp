@@ -29,6 +29,7 @@ from .client_exceptions import (
     ClientConnectionError,
     ClientOSError,
     ClientResponseError,
+    ContentDigestError,
     ContentTypeError,
     InvalidURL,
     ServerFingerprintMismatch,
@@ -37,6 +38,7 @@ from .compression_utils import HAS_BROTLI, HAS_ZSTD
 from .formdata import FormData
 from .helpers import (
     _SENTINEL,
+    EMPTY_BODY_STATUS_CODES,
     HTTP_AND_EMPTY_SCHEMA_SET,
     BaseTimerContext,
     HeadersDictProxy,
@@ -58,6 +60,7 @@ from .http import (
     HttpVersion10,
     HttpVersion11,
     StreamWriter,
+    _parse_content_digest,
 )
 from .streams import EMPTY_PAYLOAD, StreamReader
 from .typedefs import DEFAULT_JSON_DECODER, JSONDecoder, RawHeaders
@@ -237,6 +240,8 @@ class ResponseParams(TypedDict):
     skip_payload: bool
     read_until_eof: bool
     auto_decompress: bool
+    digest_check: bool
+    digest_required: bool
     read_timeout: float | None
     read_bufsize: int
     timeout_ceil_threshold: float
@@ -256,6 +261,9 @@ class ClientResponse(HeadersMixin):
 
     content: StreamReader = None  # type: ignore[assignment] # Payload stream
     _body: bytes | None = None
+    _digest_check: bool = False
+    _digest_required: bool = False
+    _digest_error: "ContentDigestError | None" = None
     _headers: HeadersDictProxy = None  # type: ignore[assignment]
     _history: tuple["ClientResponse", ...] = ()
     _raw_headers: RawHeaders = None  # type: ignore[assignment]
@@ -294,6 +302,8 @@ class ClientResponse(HeadersMixin):
         request_headers: CIMultiDict[str],
         original_url: URL,
         stream_writer: AbstractStreamWriter,
+        digest_check: bool = False,
+        digest_required: bool = False,
         **kwargs: object,
     ) -> None:
         # kwargs exists so authors of subclasses should expect to pass through unknown
@@ -321,6 +331,8 @@ class ClientResponse(HeadersMixin):
         self._cache: dict[str, Any] = {}
         self._traces = traces
         self._loop = loop
+        self._digest_check = digest_check
+        self._digest_required = digest_required
         # Save reference to _resolve_charset, so that get_encoding() will still
         # work after the response has finished reading the body.
         if session is not None:
@@ -561,11 +573,46 @@ class ClientResponse(HeadersMixin):
         if self._traces and payload is not EMPTY_PAYLOAD:
             payload._on_chunk_received = self._on_chunk_response_received
 
+        # An empty body has no dechunked bytes to hash in the payload parser,
+        # so verify the sha-256 of the zero-length payload here.
+        if (
+            self._digest_check
+            and payload is EMPTY_PAYLOAD
+            and self.method != hdrs.METH_HEAD
+            and self.status not in EMPTY_BODY_STATUS_CODES
+        ):
+            self._verify_empty_digest()
+
         # cookies
         if cookie_hdrs := self.headers._md.getall(hdrs.SET_COOKIE, ()):
             # Store raw cookie headers for CookieJar
             self._raw_cookie_headers = tuple(cookie_hdrs)
         return self
+
+    def _verify_empty_digest(self) -> None:
+        """Verify the Content-Digest sha-256 for a zero-length response body."""
+        header = self._headers.get(hdrs.CONTENT_DIGEST)
+        try:
+            digest = _parse_content_digest(header)
+        except ValueError as exc:
+            self._digest_error = ContentDigestError(
+                f"Malformed Content-Digest header: {exc}"
+            )
+            return
+
+        if digest is None:
+            if self._digest_required:
+                self._digest_error = ContentDigestError(
+                    "Content-Digest sha-256 required but not present"
+                )
+            return
+
+        empty = sha256(b"").digest()
+        if digest != empty:
+            self._digest_error = ContentDigestError(
+                f"Content-Digest sha-256 mismatch: "
+                f"expected {empty.hex()}, got {digest.hex()}"
+            )
 
     def _response_eof(self) -> None:
         if self._closed:
@@ -698,6 +745,9 @@ class ClientResponse(HeadersMixin):
 
     async def read(self) -> bytes:
         """Read response payload."""
+        if self._digest_error is not None:
+            raise self._digest_error
+
         if self._body is None:
             try:
                 self._body = await self.content.read()
@@ -930,6 +980,8 @@ class ClientRequestBase:
             request_headers=self.headers,
             original_url=self.original_url,
             stream_writer=stream_writer,
+            digest_check=False,
+            digest_required=False,
         )
 
     def _create_writer(self, protocol: BaseProtocol) -> StreamWriter:
@@ -1426,6 +1478,8 @@ class ClientRequest(ClientRequestBase):
             request_headers=self.headers,
             original_url=self.original_url,
             stream_writer=stream_writer,
+            digest_check=self._response_params.get("digest_check", False),
+            digest_required=self._response_params.get("digest_required", False),
         )
 
     def _create_writer(self, protocol: BaseProtocol) -> StreamWriter:

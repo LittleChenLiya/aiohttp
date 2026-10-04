@@ -1,10 +1,13 @@
 import abc
 import asyncio
+import base64
+import binascii
 import re
 import string
 import sys
 from contextlib import suppress
 from enum import IntEnum
+from hashlib import sha256
 from re import Pattern
 from typing import (
     TYPE_CHECKING,
@@ -22,6 +25,7 @@ from yarl import URL
 
 from . import hdrs
 from .base_protocol import BaseProtocol
+from .client_exceptions import ContentDigestError
 from .compression_utils import (
     HAS_BROTLI,
     HAS_ZSTD,
@@ -267,6 +271,8 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
         response_with_body: bool = True,
         read_until_eof: bool = False,
         auto_decompress: bool = True,
+        digest_check: bool = False,
+        digest_required: bool = False,
         max_msg_queue_size: int = 0,
     ) -> None:
         self.protocol = protocol
@@ -289,6 +295,8 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
         self._payload_parser: HttpPayloadParser | None = None
         self._payload_has_more_data = False
         self._auto_decompress = auto_decompress
+        self._digest_check = digest_check
+        self._digest_required = digest_required
         self._limit = limit
         self._headers_parser = HeadersParser(max_field_size, self.lax)
         # Stop emitting messages once this many are queued unconsumed (0 = off).
@@ -448,12 +456,15 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 code=self.code,
                                 response_with_body=self.response_with_body,
                                 auto_decompress=self._auto_decompress,
+                                digest_check=self._digest_check,
+                                digest_required=self._digest_required,
                                 lax=self.lax,
                                 headers_parser=self._headers_parser,
                                 max_line_size=self.max_line_size,
                                 max_field_size=self.max_field_size,
                                 max_trailers=max_trailers,
                                 limit=self._limit,
+                                content_digest=msg.headers.get(hdrs.CONTENT_DIGEST),
                             )
                             if not payload_parser.done:
                                 self._payload_parser = payload_parser
@@ -498,12 +509,15 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 code=self.code,
                                 response_with_body=self.response_with_body,
                                 auto_decompress=self._auto_decompress,
+                                digest_check=self._digest_check,
+                                digest_required=self._digest_required,
                                 lax=self.lax,
                                 headers_parser=self._headers_parser,
                                 max_line_size=self.max_line_size,
                                 max_field_size=self.max_field_size,
                                 max_trailers=max_trailers,
                                 limit=self._limit,
+                                content_digest=msg.headers.get(hdrs.CONTENT_DIGEST),
                             )
                             if not payload_parser.done:
                                 self._payload_parser = payload_parser
@@ -850,6 +864,111 @@ class HttpResponseParser(HttpParser[RawResponseMessage]):
         return te.rsplit(",", maxsplit=1)[-1].strip(" \t").lower() == "chunked"
 
 
+def _parse_content_digest(header: str | None) -> bytes | None:
+    """Parse an RFC 9530 Content-Digest header.
+
+    Returns the sha-256 digest bytes, or None if the header contains no
+    sha-256 digest. Raises ValueError if the header is malformed.
+    """
+    if header is None:
+        return None
+
+    header = header.strip()
+    if not header:
+        return None
+
+    digest: bytes | None = None
+    for raw_member in header.split(","):
+        member = raw_member.strip()
+        if not member:
+            raise ValueError("Empty member in Content-Digest header")
+        key, sep, value = member.partition("=")
+        if not sep:
+            raise ValueError(f"Malformed Content-Digest member: {member!r}")
+        key = key.strip().lower()
+        if key != "sha-256":
+            continue
+        if digest is not None:
+            raise ValueError("Duplicate sha-256 in Content-Digest header")
+        value = value.strip()
+        # Strip optional parameters (;key=value)
+        semi = value.find(";")
+        if semi >= 0:
+            value = value[:semi].strip()
+        if not (value.startswith(":") and value.endswith(":") and len(value) >= 2):
+            raise ValueError(f"sha-256 value is not a byte sequence: {value!r}")
+        b64 = value[1:-1]
+        try:
+            decoded = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"Invalid base64 in sha-256 digest: {b64!r}") from exc
+        if len(decoded) != 32:
+            raise ValueError(
+                f"sha-256 digest must be 32 bytes, got {len(decoded)}"
+            )
+        digest = decoded
+    return digest
+
+
+class _DigestHasher:
+    """Hash dechunked payload bytes before decompression and verify the
+    Content-Digest sha-256 on EOF.
+
+    Wraps the underlying StreamReader (which may itself be wrapped by a
+    DeflateBuffer for content-encoding). The payload parser feeds dechunked
+    bytes to this wrapper; the wrapper hashes them and forwards them to the
+    real payload, so the digest covers exactly the on-the-wire (post-chunk,
+    pre-decompression) body.
+    """
+
+    def __init__(self, payload: StreamReader, expected: bytes) -> None:
+        self._payload = payload
+        self._expected = expected
+        self._hash = sha256()
+
+    def feed_data(self, chunk: bytes) -> bool:
+        if chunk:
+            self._hash.update(chunk)
+        return self._payload.feed_data(chunk)
+
+    def feed_eof(self) -> None:
+        if self._hash.digest() != self._expected:
+            self._payload.set_exception(
+                ContentDigestError(
+                    f"Content-Digest sha-256 mismatch: "
+                    f"expected {self._expected.hex()}, "
+                    f"got {self._hash.hexdigest()}"
+                )
+            )
+        else:
+            self._payload.feed_eof()
+
+    def set_exception(
+        self,
+        exc: type[BaseException] | BaseException,
+        exc_cause: BaseException = _EXC_SENTINEL,
+    ) -> None:
+        self._payload.set_exception(exc, exc_cause)
+
+    def begin_http_chunk_receiving(self) -> None:
+        self._payload.begin_http_chunk_receiving()
+
+    def end_http_chunk_receiving(self) -> None:
+        self._payload.end_http_chunk_receiving()
+
+    @property
+    def _low_water(self) -> int:
+        return self._payload._low_water
+
+    @property
+    def total_compressed_bytes(self) -> int | None:
+        return self._payload.total_compressed_bytes
+
+    @total_compressed_bytes.setter
+    def total_compressed_bytes(self, value: int | None) -> None:
+        self._payload.total_compressed_bytes = value
+
+
 class HttpPayloadParser:
     def __init__(
         self,
@@ -861,6 +980,8 @@ class HttpPayloadParser:
         method: str | None = None,
         response_with_body: bool = True,
         auto_decompress: bool = True,
+        digest_check: bool = False,
+        digest_required: bool = False,
         lax: bool = False,
         *,
         headers_parser: HeadersParser,
@@ -868,6 +989,7 @@ class HttpPayloadParser:
         max_field_size: int = 8190,
         max_trailers: int = 128,
         limit: int = DEFAULT_CHUNK_SIZE,
+        content_digest: str | None = None,
     ) -> None:
         self._length = 0
         self._paused = False
@@ -886,13 +1008,41 @@ class HttpPayloadParser:
         self.done = False
         self._eof_pending = False
 
-        # payload decompression wrapper
+        # Build the payload chain. The hasher must sit between the parser and
+        # the decompressor so the hash covers the dechunked bytes before any
+        # content-encoding decompression.
         if response_with_body and compression and self._auto_decompress:
-            real_payload: StreamReader | DeflateBuffer = DeflateBuffer(
+            payload_wrapper: StreamReader | DeflateBuffer = DeflateBuffer(
                 payload, compression, max_decompress_size=limit
             )
         else:
-            real_payload = payload
+            payload_wrapper = payload
+
+        if digest_check:
+            try:
+                expected = _parse_content_digest(content_digest)
+            except ValueError as exc:
+                # Defer the error to read() so it surfaces as ContentDigestError
+                # rather than being wrapped by the protocol parser.
+                payload.set_exception(
+                    ContentDigestError(f"Malformed Content-Digest header: {exc}")
+                )
+                expected = None
+            if expected is not None:
+                real_payload: StreamReader | DeflateBuffer | _DigestHasher = (
+                    _DigestHasher(payload_wrapper, expected)
+                )
+            elif digest_required:
+                payload.set_exception(
+                    ContentDigestError(
+                        "Content-Digest sha-256 required but not present"
+                    )
+                )
+                real_payload = payload_wrapper
+            else:
+                real_payload = payload_wrapper
+        else:
+            real_payload = payload_wrapper
 
         # payload parser
         if not response_with_body:

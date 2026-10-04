@@ -9,6 +9,7 @@ from .http_parser import (
     HttpResponseParser,
     RawRequestMessage,
     RawResponseMessage,
+    _parse_content_digest,
 )
 from .http_websocket import (
     WS_CLOSED_MESSAGE,
@@ -42,6 +43,7 @@ __all__ = (
     "HttpResponseParser",
     "RawRequestMessage",
     "RawResponseMessage",
+    "_parse_content_digest",
     # .http_websocket
     "WS_CLOSED_MESSAGE",
     "WS_CLOSING_MESSAGE",

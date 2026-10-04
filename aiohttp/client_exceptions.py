@@ -41,6 +41,7 @@ __all__ = (
     "WSServerHandshakeError",
     "ContentTypeError",
     "ClientPayloadError",
+    "ContentDigestError",
     "InvalidURL",
     "InvalidUrlClientError",
     "RedirectClientError",
@@ -259,6 +260,15 @@ class ServerFingerprintMismatch(ServerConnectionError):
 
 class ClientPayloadError(ClientError):
     """Response payload error."""
+
+
+class ContentDigestError(ClientPayloadError):
+    """Response Content-Digest verification failed.
+
+    Raised when the response body's sha-256 digest (computed over the
+    dechunked, pre-decompression bytes) does not match the Content-Digest
+    header, or when a required digest is missing or malformed.
+    """
 
 
 class InvalidURL(ClientError, ValueError):

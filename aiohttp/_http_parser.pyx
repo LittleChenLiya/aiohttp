@@ -31,13 +31,18 @@ from .http_exceptions import (
     PayloadEncodingError,
     TransferEncodingError,
 )
-from .http_parser import DeflateBuffer as _DeflateBuffer
+from .http_parser import (
+    DeflateBuffer as _DeflateBuffer,
+    _DigestHasher as _DigestHasherBase,
+    _parse_content_digest as _parse_content_digest_fn,
+)
 from .http_writer import (
     HttpVersion as _HttpVersion,
     HttpVersion10 as _HttpVersion10,
     HttpVersion11 as _HttpVersion11,
 )
 from .streams import EMPTY_PAYLOAD as _EMPTY_PAYLOAD, StreamReader as _StreamReader
+from .client_exceptions import ContentDigestError as _ContentDigestError
 
 cimport cython
 
@@ -71,6 +76,9 @@ cdef object CONTENT_ENCODING = hdrs.CONTENT_ENCODING
 cdef object EMPTY_PAYLOAD = _EMPTY_PAYLOAD
 cdef object StreamReader = _StreamReader
 cdef object DeflateBuffer = _DeflateBuffer
+cdef object DigestHasher = _DigestHasherBase
+cdef object parse_content_digest = _parse_content_digest_fn
+cdef object ContentDigestError = _ContentDigestError
 cdef tuple EMPTY_FEED_DATA_RESULT = ((), False, b"")
 
 # RFC 9110 singleton headers — duplicates are rejected in strict mode.
@@ -344,6 +352,8 @@ cdef class HttpParser:
         object  _payload_exception
         object  _last_error
         bint    _auto_decompress
+        bint    _digest_check
+        bint    _digest_required
         int     _limit
 
         str     _content_encoding
@@ -373,6 +383,7 @@ cdef class HttpParser:
         size_t max_field_size=8190, payload_exception=None,
         bint response_with_body=True, bint read_until_eof=False,
         bint auto_decompress=True,
+        bint digest_check=False, bint digest_required=False,
         Py_ssize_t max_msg_queue_size=0,
     ):
         cparser.llhttp_settings_init(self._csettings)
@@ -410,6 +421,8 @@ cdef class HttpParser:
         self._upgraded = False
         self._pending_upgrade = False
         self._auto_decompress = auto_decompress
+        self._digest_check = digest_check
+        self._digest_required = digest_required
         self._content_encoding = None
         self._lax = False
         self._seen_singletons = set()
@@ -548,8 +561,39 @@ cdef class HttpParser:
 
         self._payload = payload
         self._content_length_expected = self._cparser.content_length
+
+        # Build the payload chain. The hasher must sit between the parser and
+        # the decompressor so the hash covers the dechunked bytes before any
+        # content-encoding decompression.
         if encoding is not None and self._auto_decompress:
-            self._payload = DeflateBuffer(payload, encoding, max_decompress_size=self._limit)
+            payload_wrapper = DeflateBuffer(payload, encoding, max_decompress_size=self._limit)
+        else:
+            payload_wrapper = payload
+
+        if self._digest_check and payload is not EMPTY_PAYLOAD:
+            content_digest = headers.get(hdrs.CONTENT_DIGEST)
+            try:
+                expected = parse_content_digest(content_digest)
+            except ValueError as exc:
+                # Defer the error to read() so it surfaces as ContentDigestError
+                # rather than being wrapped by the protocol parser.
+                payload.set_exception(
+                    ContentDigestError(f"Malformed Content-Digest header: {exc}")
+                )
+                expected = None
+            if expected is not None:
+                self._payload = DigestHasher(payload_wrapper, expected)
+            elif self._digest_required:
+                payload.set_exception(
+                    ContentDigestError(
+                        "Content-Digest sha-256 required but not present"
+                    )
+                )
+                self._payload = payload_wrapper
+            else:
+                self._payload = payload_wrapper
+        else:
+            self._payload = payload_wrapper
 
         self._messages.append((msg, payload))
         if self._max_msg_queue_size:
@@ -730,12 +774,14 @@ cdef class HttpRequestParser(HttpParser):
         size_t max_line_size=8190, size_t max_headers=128,
         size_t max_field_size=8190, payload_exception=None,
         bint response_with_body=True, bint read_until_eof=False,
-        bint auto_decompress=True, Py_ssize_t max_msg_queue_size=0,
+        bint auto_decompress=True, bint digest_check=False,
+        bint digest_required=False, Py_ssize_t max_msg_queue_size=0,
     ):
         self._init(cparser.HTTP_REQUEST, protocol, loop, limit, timer,
                    max_line_size, max_headers, max_field_size,
                    payload_exception, response_with_body, read_until_eof,
-                   auto_decompress, max_msg_queue_size)
+                   auto_decompress, digest_check, digest_required,
+                   max_msg_queue_size)
 
     cdef object _on_status_complete(self):
         cdef int idx1, idx2
@@ -794,12 +840,13 @@ cdef class HttpResponseParser(HttpParser):
             size_t max_line_size=8190, size_t max_headers=128,
             size_t max_field_size=8190, payload_exception=None,
             bint response_with_body=True, bint read_until_eof=False,
-            bint auto_decompress=True
+            bint auto_decompress=True, bint digest_check=False,
+            bint digest_required=False
     ):
         self._init(cparser.HTTP_RESPONSE, protocol, loop, limit, timer,
                    max_line_size, max_headers, max_field_size,
                    payload_exception, response_with_body, read_until_eof,
-                   auto_decompress)
+                   auto_decompress, digest_check, digest_required)
         # Use strict parsing on dev mode, so users are warned about broken servers.
         if not DEBUG:
             cparser.llhttp_set_lenient_headers(self._cparser, 1)

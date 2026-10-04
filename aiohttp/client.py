@@ -190,6 +190,8 @@ class _RequestOptions(TypedDict, total=False):
     trace_request_ctx: object
     read_bufsize: int | None
     auto_decompress: bool | None
+    digest_check: bool | None
+    digest_required: bool | None
     max_line_size: int | None
     max_field_size: int | None
     max_headers: int | None
@@ -273,6 +275,8 @@ class ClientSession:
         "_timeout",
         "_raise_for_status",
         "_auto_decompress",
+        "_digest_check",
+        "_digest_required",
         "_trust_env",
         "_default_headers",
         "_skip_auto_headers",
@@ -312,6 +316,8 @@ class ClientSession:
         raise_for_status: bool | Callable[[ClientResponse], Awaitable[None]] = False,
         timeout: _SENTINEL | ClientTimeout | None = sentinel,
         auto_decompress: bool = True,
+        digest_check: bool = False,
+        digest_required: bool = False,
         trust_env: bool = False,
         requote_redirect_url: bool = True,
         trace_configs: list[TraceConfig[object]] | None = None,
@@ -389,6 +395,8 @@ class ClientSession:
         self._json_serialize_bytes = json_serialize_bytes
         self._raise_for_status = raise_for_status
         self._auto_decompress = auto_decompress
+        self._digest_check = digest_check
+        self._digest_required = digest_required
         self._trust_env = trust_env
         self._requote_redirect_url = requote_redirect_url
         self._read_bufsize = read_bufsize
@@ -490,6 +498,8 @@ class ClientSession:
         trace_request_ctx: object = None,
         read_bufsize: int | None = None,
         auto_decompress: bool | None = None,
+        digest_check: bool | None = None,
+        digest_required: bool | None = None,
         max_line_size: int | None = None,
         max_field_size: int | None = None,
         max_headers: int | None = None,
@@ -578,6 +588,12 @@ class ClientSession:
 
         if auto_decompress is None:
             auto_decompress = self._auto_decompress
+
+        if digest_check is None:
+            digest_check = self._digest_check
+
+        if digest_required is None:
+            digest_required = self._digest_required
 
         if max_line_size is None:
             max_line_size = self._max_line_size
@@ -677,6 +693,8 @@ class ClientSession:
                         "skip_payload": method in EMPTY_BODY_METHODS,
                         "read_until_eof": read_until_eof,
                         "auto_decompress": auto_decompress,
+                        "digest_check": digest_check,
+                        "digest_required": digest_required,
                         "read_timeout": real_timeout.sock_read,
                         "read_bufsize": read_bufsize,
                         "timeout_ceil_threshold": self._connector._timeout_ceil_threshold,
@@ -1433,6 +1451,16 @@ class ClientSession:
     def auto_decompress(self) -> bool:
         """Should the body response be automatically decompressed."""
         return self._auto_decompress
+
+    @property
+    def digest_check(self) -> bool:
+        """Should the response Content-Digest sha-256 be verified."""
+        return self._digest_check
+
+    @property
+    def digest_required(self) -> bool:
+        """Should a missing or unsupported Content-Digest be an error."""
+        return self._digest_required
 
     @property
     def trust_env(self) -> bool:
