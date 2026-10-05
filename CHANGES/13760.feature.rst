@@ -1,0 +1,8 @@
+:meth:`~aiohttp.ClientResponse.text` now decodes response bodies incrementally
+using a new :class:`~aiohttp._text_decoder._TextDecoder` adapter. The decoder
+buffers only incomplete multibyte sequences (not the whole response), tracks
+the original byte offset of each buffered sequence, and reports the first raw
+offset when a strict-mode decode error occurs. BOM and multibyte characters
+can span chunk boundaries; BOM is stripped only at the start of the stream.
+On decode failure, the response connection is returned to the pool so it can be
+reused -- by :user:`claude`.

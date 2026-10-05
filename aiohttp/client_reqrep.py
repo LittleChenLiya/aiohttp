@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict
 from multidict import CIMultiDict, CIMultiDictProxy, MultiDict, MultiDictProxy
 from yarl import URL, Query
 
-from . import hdrs, multipart, payload
+from . import _text_decoder, hdrs, multipart, payload
 from ._cookie_helpers import (
     parse_cookie_header,
     parse_set_cookie_headers,
@@ -737,12 +737,59 @@ class ClientResponse(HeadersMixin):
 
     async def text(self, encoding: str | None = None, errors: str = "strict") -> str:
         """Read response payload and decode."""
-        await self.read()
+        if self._body is not None:
+            # Body already cached (e.g. read() was called); decode it directly.
+            if self._released:  # Response explicitly released
+                raise ClientConnectionError("Connection closed")
+            if encoding is None:
+                encoding = self.get_encoding()
+            return self._body.decode(encoding, errors=errors)  # type: ignore[union-attr]
 
         if encoding is None:
-            encoding = self.get_encoding()
+            try:
+                encoding = self.get_encoding()
+            except RuntimeError:
+                # Charset not known up front (no charset in Content-Type and
+                # no default for this mimetype); read the whole body first so
+                # the charset resolver can inspect it.
+                await self.read()
+                encoding = self.get_encoding()
+                return self._body.decode(encoding, errors=errors)  # type: ignore[union-attr]
 
-        return self._body.decode(encoding, errors=errors)  # type: ignore[union-attr]
+        # Incremental decode from the stream. The decoder buffers only
+        # incomplete multibyte sequences, not the whole response.
+        decoder = _text_decoder._TextDecoder(encoding, errors)
+        text_parts: list[str] = []
+        raw_parts: list[bytes] = []
+        try:
+            while True:
+                try:
+                    chunk = await self.content.readchunk()
+                except TypeError:
+                    # Content object that does not support readchunk() (e.g. a
+                    # mock); read the whole body at once and decode it.
+                    body = await self.content.read()
+                    raw_parts.append(body)
+                    text_parts.append(decoder.decode(body))
+                    break
+                if not isinstance(chunk, tuple):
+                    body = await self.content.read()
+                    raw_parts.append(body)
+                    text_parts.append(decoder.decode(body))
+                    break
+                data, _ = chunk
+                if not data:
+                    break
+                raw_parts.append(data)
+                text_parts.append(decoder.decode(data))
+            text_parts.append(decoder.decode(b"", final=True))
+        except BaseException:
+            # Return the connection to the pool on failure so it can be reused.
+            self.release()
+            raise
+        self._body = b"".join(raw_parts)
+        await self._wait_released()  # Underlying connection released
+        return "".join(text_parts)
 
     async def json(
         self,
