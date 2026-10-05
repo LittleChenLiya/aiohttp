@@ -46,6 +46,7 @@ import aiohttp
 from aiohttp import Fingerprint, ServerFingerprintMismatch, hdrs, payload, web
 from aiohttp.abc import AbstractResolver, ResolveResult
 from aiohttp.client_exceptions import (
+    ClientExpect100TimeoutError,
     ClientResponseError,
     InvalidURL,
     InvalidUrlClientError,
@@ -2369,6 +2370,125 @@ async def test_expect100_continue_with_none_payload(
 
     # Expect handler should still be called even with no body
     assert expect_received
+
+
+async def test_expect100_final_response_body_not_read(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """A final response (417) before 100-continue must not read the body."""
+    reads = 0
+
+    async def gen() -> AsyncIterator[bytes]:
+        nonlocal reads
+        reads += 1
+        yield b"some data"
+
+    async def handler(request: web.Request) -> web.Response:
+        return web.Response(text="must not run")
+
+    async def expect_handler(request: web.Request) -> None:
+        # Reject the expectation right away instead of sending 100-continue.
+        raise web.HTTPExpectationFailed()
+
+    app = web.Application()
+    app.router.add_post("/", handler, expect_handler=expect_handler)
+    client = await aiohttp_client(app)
+
+    async with client.post("/", data=gen(), expect100=True) as resp:
+        assert resp.status == 417
+    assert reads == 0
+
+
+async def test_expect100_redirect_before_100_continue(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """A redirect received instead of 100-continue must not read the body.
+
+    The body producer is only consumed once the redirect target sends
+    100-continue.
+    """
+    reads = 0
+
+    async def gen() -> AsyncIterator[bytes]:
+        nonlocal reads
+        reads += 1
+        yield b"some data"
+
+    async def no_continue_expect_handler(request: web.Request) -> None:
+        # Do not send 100-continue; let the handler respond directly.
+        pass
+
+    async def redirect_handler(request: web.Request) -> web.Response:
+        raise web.HTTPTemporaryRedirect("/target")
+
+    async def continue_expect_handler(request: web.Request) -> None:
+        assert request.transport is not None
+        request.transport.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+
+    async def target_handler(request: web.Request) -> web.Response:
+        body = await request.read()
+        assert body == b"some data"
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_post(
+        "/redirect", redirect_handler, expect_handler=no_continue_expect_handler
+    )
+    app.router.add_post(
+        "/target", target_handler, expect_handler=continue_expect_handler
+    )
+    client = await aiohttp_client(app)
+
+    async with client.post("/redirect", data=gen(), expect100=True) as resp:
+        assert resp.status == 200
+        assert await resp.text() == "OK"
+    # The body was read exactly once: for the redirect target, after its
+    # 100-continue. The 307 response never triggered a read.
+    assert reads == 1
+
+
+async def test_expect100_late_100_continue_after_reject(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """A 100-continue arriving after the wait was rejected is a no-op.
+
+    The cancelled writer must not be restarted and the body producer must
+    stay unread.
+    """
+    reads = 0
+
+    async def gen() -> AsyncIterator[bytes]:
+        nonlocal reads
+        reads += 1
+        yield b"some data"
+
+    async def handler(request: web.Request) -> web.Response:
+        return web.Response(text="late")
+
+    async def expect_handler(request: web.Request) -> None:
+        # Send 100-continue only after the client-side deadline expired.
+        await asyncio.sleep(0.5)
+        assert request.transport is not None
+        with suppress(ConnectionError, RuntimeError, asyncio.CancelledError):
+            request.transport.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+
+    app = web.Application()
+    app.router.add_post("/", handler, expect_handler=expect_handler)
+    client = await aiohttp_client(app)
+
+    with pytest.raises(ClientExpect100TimeoutError):
+        async with client.post(
+            "/",
+            data=gen(),
+            expect100=True,
+            expect100_timeout=0.1,
+            expect100_timeout_policy="reject",
+        ):
+            pass
+    # Let the server's late 100-continue arrive; it cannot restart the
+    # cancelled writer.
+    await asyncio.sleep(0.6)
+    assert reads == 0
 
 
 @pytest.mark.usefixtures("parametrize_zlib_backend")

@@ -1,0 +1,10 @@
+Added an optional wait deadline for ``Expect: 100-continue`` uploads:
+``expect100_timeout`` bounds how long the client waits for the server's
+``100 Continue`` before acting on ``expect100_timeout_policy`` -- ``"send"``
+sends the request body anyway, while ``"reject"`` (default) aborts the
+upload without reading the body and raises
+:class:`aiohttp.ClientExpect100TimeoutError`. A final response (e.g. ``417``
+or a redirect) received before ``100 Continue`` now stops the pending wait
+immediately, so the body producer is never read and no data is sent later;
+a late ``100 Continue`` cannot restart the cancelled writer. The default
+handshake (no timeout) is unchanged -- by :user:`aio-libs`.

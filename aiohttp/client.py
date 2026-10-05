@@ -45,6 +45,7 @@ from .client_exceptions import (
     ClientConnectorError,
     ClientConnectorSSLError,
     ClientError,
+    ClientExpect100TimeoutError,
     ClientHttpProxyError,
     ClientOSError,
     ClientPayloadError,
@@ -74,6 +75,7 @@ from .client_reqrep import (
     ClientRequest,
     ClientResponse,
     ClientTimeout,
+    Expect100TimeoutPolicy,
     Fingerprint,
     RequestInfo,
     ResponseParams,
@@ -117,6 +119,7 @@ __all__ = (
     "ClientConnectorError",
     "ClientConnectorSSLError",
     "ClientError",
+    "ClientExpect100TimeoutError",
     "ClientHttpProxyError",
     "ClientOSError",
     "ClientPayloadError",
@@ -180,6 +183,8 @@ class _RequestOptions(TypedDict, total=False):
     compress: Literal["deflate", "gzip"] | bool
     chunked: bool | None
     expect100: bool
+    expect100_timeout: float | None
+    expect100_timeout_policy: Expect100TimeoutPolicy
     raise_for_status: None | bool | Callable[[ClientResponse], Awaitable[None]]
     read_until_eof: bool
     proxy: StrOrURL | None
@@ -478,6 +483,8 @@ class ClientSession:
         compress: Literal["deflate", "gzip"] | bool = False,
         chunked: bool | None = None,
         expect100: bool = False,
+        expect100_timeout: float | None = None,
+        expect100_timeout_policy: Expect100TimeoutPolicy = "reject",
         raise_for_status: (
             None | bool | Callable[[ClientResponse], Awaitable[None]]
         ) = None,
@@ -697,6 +704,8 @@ class ClientSession:
                         compress=compress,
                         chunked=chunked,
                         expect100=expect100,
+                        expect100_timeout=expect100_timeout,
+                        expect100_timeout_policy=expect100_timeout_policy,
                         loop=self._loop,
                         response_class=self._response_class,
                         proxy=proxy_,
@@ -1582,6 +1591,13 @@ else:
         with deflate encoding.
         chunked - Set to chunk size for chunked transfer encoding.
         expect100 - Expect 100-continue response from server.
+        expect100_timeout - (optional) Maximum time in seconds to wait
+        for the 100-continue response before applying
+        expect100_timeout_policy. None (default) waits indefinitely.
+        expect100_timeout_policy - (optional) What to do when
+        expect100_timeout expires: "send" sends the request body anyway,
+        "reject" (default) aborts the upload without reading the body
+        and raises ClientExpect100TimeoutError.
         connector - BaseConnector sub-class instance to support
         connection pooling.
         read_until_eof - Read response until eof if response

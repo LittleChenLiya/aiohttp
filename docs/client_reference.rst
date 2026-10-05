@@ -401,7 +401,9 @@ The client session supports the context manager protocol for self closing.
                          cookies=None, headers=None, skip_auto_headers=None, \
                          allow_redirects=True,\
                          max_redirects=10,\
-                         compress=None, chunked=None, expect100=False, raise_for_status=None,\
+                         compress=None, chunked=None, expect100=False, \
+                         expect100_timeout=None, expect100_timeout_policy="reject", \
+                         raise_for_status=None,\
                          read_until_eof=True, \
                          proxy=None,\
                          timeout=sentinel, ssl=True, \
@@ -499,6 +501,23 @@ The client session supports the context manager protocol for self closing.
 
       :param bool expect100: Expect 100-continue response from server.
                              ``False`` by default (optional).
+
+      :param float expect100_timeout: Maximum time in seconds to wait for
+                             the 100-continue response before applying
+                             *expect100_timeout_policy*. ``None`` (default)
+                             waits indefinitely, preserving the historical
+                             handshake behavior (optional).
+
+      :param expect100_timeout_policy: Action taken when
+                             *expect100_timeout* expires before 100-continue
+                             arrives: ``"send"`` sends the request body
+                             anyway (as permitted by RFC 9110), while
+                             ``"reject"`` (default) aborts the upload
+                             without reading the body and raises
+                             :class:`ClientExpect100TimeoutError`.
+                             If a final response (e.g. ``417``) arrives
+                             before the deadline, the body is never sent,
+                             regardless of this policy.
 
       :param bool raise_for_status: Automatically call :meth:`ClientResponse.raise_for_status` for
                                     response if set to ``True``.
@@ -901,7 +920,9 @@ certification chaining.
                         json=None,\
                         cookies=None, headers=None, skip_auto_headers=None, \
                         allow_redirects=True, max_redirects=10, \
-                        compress=False, chunked=None, expect100=False, raise_for_status=None, \
+                        compress=False, chunked=None, expect100=False, \
+                        expect100_timeout=None, expect100_timeout_policy="reject", \
+                        raise_for_status=None, \
                         read_until_eof=True, \
                         proxy=None, \
                         timeout=sentinel, ssl=True, \
@@ -996,6 +1017,22 @@ certification chaining.
 
    :param bool expect100: Expect 100-continue response from server.
                           ``False`` by default (optional).
+
+   :param float expect100_timeout: Maximum time in seconds to wait for
+                          the 100-continue response before applying
+                          *expect100_timeout_policy*. ``None`` (default)
+                          waits indefinitely, preserving the historical
+                          handshake behavior (optional).
+
+   :param expect100_timeout_policy: Action taken when *expect100_timeout*
+                          expires before 100-continue arrives: ``"send"``
+                          sends the request body anyway (as permitted by
+                          RFC 9110), while ``"reject"`` (default) aborts the
+                          upload without reading the body and raises
+                          :class:`ClientExpect100TimeoutError`.
+                          If a final response (e.g. ``417``) arrives before
+                          the deadline, the body is never sent, regardless
+                          of this policy.
 
    :param bool raise_for_status: Automatically call
                                  :meth:`ClientResponse.raise_for_status`
@@ -2989,6 +3026,15 @@ Connection errors
 
    Derived from :exc:`ServerTimeoutError`
 
+.. class:: ClientExpect100TimeoutError
+   :canonical: aiohttp.client_exceptions.ClientExpect100TimeoutError
+
+   The server did not send a ``100 Continue`` response within
+   ``expect100_timeout`` and the ``"reject"`` timeout policy aborted the
+   upload. The request body was not read or sent.
+
+   Derived from :exc:`ServerTimeoutError`
+
 Hierarchy of exceptions
 ^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -3025,6 +3071,8 @@ Hierarchy of exceptions
         * :exc:`ConnectionTimeoutError`
 
         * :exc:`SocketTimeoutError`
+
+        * :exc:`ClientExpect100TimeoutError`
 
   * :exc:`ClientPayloadError`
 

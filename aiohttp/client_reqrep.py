@@ -27,6 +27,7 @@ from .abc import AbstractStreamWriter
 from .base_protocol import BaseProtocol
 from .client_exceptions import (
     ClientConnectionError,
+    ClientExpect100TimeoutError,
     ClientOSError,
     ClientResponseError,
     ContentTypeError,
@@ -536,6 +537,13 @@ class ClientResponse(HeadersMixin):
                     ) from exc
 
                 if message.code < 100 or message.code > 199 or message.code == 101:
+                    # A final response arrived before 100-continue: the
+                    # server does not expect the request body. Wake the
+                    # pending wait with a "do not send" outcome so the body
+                    # producer is never read and no data is sent later.
+                    if self._continue is not None:
+                        set_result(self._continue, False)
+                        self._continue = None
                     break
 
                 if self._continue is not None:
@@ -1023,6 +1031,13 @@ class ClientRequestBase:
         assert False
 
 
+# Policy applied when the ``expect100_timeout`` deadline expires before
+# the server sends a ``100 Continue`` response:
+# - "send": send the request body anyway (permitted by RFC 9110);
+# - "reject": abort the upload without reading the body producer.
+Expect100TimeoutPolicy = Literal["send", "reject"]
+
+
 class ClientRequestArgs(TypedDict, total=False):
     params: Query
     headers: CIMultiDict[str]
@@ -1033,6 +1048,9 @@ class ClientRequestArgs(TypedDict, total=False):
     compress: Literal["deflate", "gzip"] | bool
     chunked: bool | None
     expect100: bool
+    expect100_timeout: float | None
+    expect100_timeout_policy: Expect100TimeoutPolicy
+    expect100_clock: Callable[[], float] | None
     loop: asyncio.AbstractEventLoop
     response_class: type[ClientResponse]
     proxy: URL | None
@@ -1051,6 +1069,9 @@ class ClientRequest(ClientRequestBase):
     _EMPTY_BODY = payload.PAYLOAD_REGISTRY.get(b"", disposition=None)
     _body = _EMPTY_BODY
     _continue = None  # waiter future for '100 Continue' response
+    _expect100_timeout: float | None = None
+    _expect100_timeout_policy: Expect100TimeoutPolicy = "reject"
+    _expect100_clock: Callable[[], float] | None = None
     _response_params: ResponseParams = None  # type: ignore[assignment]
     _session: "ClientSession" = None  # type: ignore[assignment]
     _timeout = ClientTimeout()
@@ -1081,6 +1102,9 @@ class ClientRequest(ClientRequestBase):
         compress: Literal["deflate", "gzip"] | bool,
         chunked: bool | None,
         expect100: bool,
+        expect100_timeout: float | None = None,
+        expect100_timeout_policy: Expect100TimeoutPolicy = "reject",
+        expect100_clock: Callable[[], float] | None = None,
         loop: asyncio.AbstractEventLoop,
         response_class: type[ClientResponse],
         proxy: URL | None,
@@ -1124,6 +1148,21 @@ class ClientRequest(ClientRequestBase):
         self._update_body_from_data(data)
         if data is not None or self.method not in self.GET_METHODS:
             self._update_transfer_encoding()
+        if expect100_timeout is not None and expect100_timeout < 0:
+            raise ValueError(
+                "expect100_timeout must be non-negative, "
+                f"got {expect100_timeout!r}"
+            )
+        if expect100_timeout_policy not in ("send", "reject"):
+            raise ValueError(
+                "expect100_timeout_policy must be 'send' or 'reject', "
+                f"got {expect100_timeout_policy!r}"
+            )
+        self._expect100_timeout = expect100_timeout
+        self._expect100_timeout_policy = expect100_timeout_policy
+        self._expect100_clock = (
+            expect100_clock if expect100_clock is not None else self.loop.time
+        )
         self._update_expect_continue(expect100)
         self._traces = traces
 
@@ -1456,6 +1495,59 @@ class ClientRequest(ClientRequestBase):
             self.body.size != 0 or self._continue is not None or protocol.writing_paused
         )
 
+    async def _wait_for_continue(self) -> bool:
+        """Wait for the 100-continue response, honoring the optional deadline.
+
+        Returns True when the request body should be sent and False when a
+        final response arrived first, meaning the server does not expect
+        the body.
+
+        Raises ClientExpect100TimeoutError when the ``expect100_timeout``
+        deadline expires and the timeout policy rejects the upload.
+        """
+        continue100 = self._continue
+        assert continue100 is not None
+        timeout = self._expect100_timeout
+        if timeout is None:
+            # Default behavior: wait indefinitely for 100-continue.
+            return bool(await continue100)
+        clock = self._expect100_clock
+        assert clock is not None
+        deadline = clock() + timeout
+        remaining = deadline - clock()
+        if remaining > 0:
+            try:
+                return bool(
+                    await asyncio.wait_for(asyncio.shield(continue100), remaining)
+                )
+            except asyncio.TimeoutError:
+                if continue100.done():
+                    # 100-continue (or a final response) arrived just as the
+                    # timer fired.
+                    return bool(await continue100)
+        # The deadline expired before 100-continue arrived.
+        if self._expect100_timeout_policy == "send":
+            # Explicitly chosen policy: send the body anyway, as RFC 9110
+            # permits once the client is done waiting.
+            return True
+        # Explicitly chosen policy: reject the upload. Release the waiter
+        # future and every reference to it so a late 100-continue is
+        # ignored and cannot restart the (already finished) writer.
+        self._cancel_continue_wait()
+        raise ClientExpect100TimeoutError(
+            f"Server did not send 100-continue within {timeout} seconds; "
+            f"upload to {self.url !s} rejected"
+        )
+
+    def _cancel_continue_wait(self) -> None:
+        """Cancel the pending 100-continue wait and release its references."""
+        continue100, self._continue = self._continue, None
+        if continue100 is not None:
+            continue100.cancel()
+        response = self._response
+        if response is not None and response._continue is continue100:
+            response._continue = None
+
     async def _write_bytes(
         self,
         writer: AbstractStreamWriter,
@@ -1488,15 +1580,33 @@ class ClientRequest(ClientRequestBase):
             asyncio.CancelledError: When the operation is cancelled
 
         """
+        protocol = conn.protocol
+        assert protocol is not None
+
         # 100 response
         if self._continue is not None:
             # Force headers to be sent before waiting for 100-continue
             writer.send_headers()
             await writer.drain()
-            await self._continue
+            try:
+                send_body = await self._wait_for_continue()
+            except ClientExpect100TimeoutError as exc:
+                # The wait deadline expired and the policy rejects the
+                # upload: fail the pending response read and drop the
+                # connection without ever reading the body producer.
+                set_exception(protocol, exc)
+                conn.close()
+                return
+            if not send_body:
+                # A final response arrived before 100-continue: the server
+                # does not expect the body. Never read the body producer
+                # and never send data on this connection later.
+                if self._body.size != 0:
+                    # The announced body was never sent, so the connection
+                    # cannot be reused for another request.
+                    protocol.force_close()
+                return
 
-        protocol = conn.protocol
-        assert protocol is not None
         try:
             await self._body.write_with_length(writer, content_length)
         except OSError as underlying_exc:

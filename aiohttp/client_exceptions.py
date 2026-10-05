@@ -32,6 +32,7 @@ __all__ = (
     "ClientConnectorCertificateError",
     "ConnectionTimeoutError",
     "SocketTimeoutError",
+    "ClientExpect100TimeoutError",
     "ServerConnectionError",
     "ServerTimeoutError",
     "ServerDisconnectedError",
@@ -239,6 +240,14 @@ class ConnectionTimeoutError(ServerTimeoutError):
 
 class SocketTimeoutError(ServerTimeoutError):
     """Socket timeout error."""
+
+
+class ClientExpect100TimeoutError(ServerTimeoutError):
+    """Timeout waiting for the server's 100-continue response.
+
+    Raised when ``expect100_timeout`` expires before the server sends
+    ``100 Continue`` and the configured timeout policy rejects the upload.
+    """
 
 
 class ServerFingerprintMismatch(ServerConnectionError):

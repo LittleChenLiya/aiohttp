@@ -16,7 +16,7 @@ import aiohttp
 from aiohttp import BaseConnector, hdrs, payload
 from aiohttp.abc import AbstractStreamWriter
 from aiohttp.base_protocol import BaseProtocol
-from aiohttp.client_exceptions import ClientConnectionError
+from aiohttp.client_exceptions import ClientConnectionError, ClientExpect100TimeoutError
 from aiohttp.client_reqrep import (
     ClientRequest,
     ClientRequestArgs,
@@ -28,8 +28,8 @@ from aiohttp.client_reqrep import (
 from aiohttp.compression_utils import ZLibBackend
 from aiohttp.connector import Connection
 from aiohttp.hdrs import METH_DELETE
-from aiohttp.helpers import HeadersDictProxy, TimerNoop
-from aiohttp.http import HttpVersion10, HttpVersion11, StreamWriter
+from aiohttp.helpers import HeadersDictProxy, TimerNoop, set_result
+from aiohttp.http import HttpVersion10, HttpVersion11, RawResponseMessage, StreamWriter
 from aiohttp.multipart import MultipartWriter
 
 if sys.version_info >= (3, 11):
@@ -1452,6 +1452,222 @@ async def test_data_continue(
     assert buf.split(b"\r\n\r\n", 1)[1] == b"data"
     await req._close()
     resp.close()
+
+
+class _VirtualClock:
+    """Manually advanced monotonic clock for expect100 deadline tests."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _expired_expect100_clock() -> Callable[[], float]:
+    """Virtual clock that jumps past the wait deadline on its second read.
+
+    The first call (deadline computation) returns 0; every later call
+    returns a far-future timestamp, so the 100-continue wait deadline is
+    always expired without any real sleeping.
+    """
+    calls = 0
+
+    def clock() -> float:
+        nonlocal calls
+        calls += 1
+        return 0.0 if calls == 1 else 1e9
+
+    return clock
+
+
+async def test_expect100_timeout_reject_policy_virtual_clock(
+    buf: bytearray, conn: mock.Mock, make_client_request: _RequestMaker
+) -> None:
+    """Expired virtual deadline with the reject policy must not read the body."""
+    loop = asyncio.get_running_loop()
+    reads = 0
+
+    async def gen() -> AsyncIterator[bytes]:
+        nonlocal reads
+        reads += 1
+        yield b"test"
+
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=gen(),
+        expect100=True,
+        expect100_timeout=10.0,
+        expect100_timeout_policy="reject",
+        expect100_clock=_expired_expect100_clock(),
+        loop=loop,
+    )
+    continue100 = req._continue
+    assert continue100 is not None
+    resp = await req._send(conn)
+    # The writer may have finished eagerly (Python 3.12+) since the
+    # already-expired deadline never suspends it.
+    if req._writer is not None:
+        await req._writer
+
+    # The body producer was never read and nothing was sent past the headers.
+    assert reads == 0
+    assert buf.split(b"\r\n\r\n", 1)[1] == b""
+    # The cancelled wait released the waiter future and every reference to
+    # it, so a late 100-continue cannot restart the finished writer.
+    assert continue100.cancelled()
+    assert req._continue is None
+    assert resp._continue is None
+    await asyncio.sleep(0)
+    assert req._writer is None
+    # The pending response read was failed with a dedicated timeout error.
+    exc = conn.protocol.set_exception.call_args[0][0]
+    assert isinstance(exc, ClientExpect100TimeoutError)
+    conn.close.assert_called_once_with()
+    # A late 100-continue is ignored: the writer is not restarted and the
+    # body producer stays unread.
+    set_result(continue100, True)
+    await asyncio.sleep(0)
+    assert req._writer is None
+    assert reads == 0
+    await req._close()
+    resp.close()
+
+
+async def test_expect100_timeout_send_policy_virtual_clock(
+    buf: bytearray, conn: mock.Mock, make_client_request: _RequestMaker
+) -> None:
+    """Expired virtual deadline with the send policy sends the body anyway."""
+    loop = asyncio.get_running_loop()
+    reads = 0
+
+    async def gen() -> AsyncIterator[bytes]:
+        nonlocal reads
+        reads += 1
+        yield b"test"
+
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=gen(),
+        expect100=True,
+        expect100_timeout=10.0,
+        expect100_timeout_policy="send",
+        expect100_clock=_expired_expect100_clock(),
+        loop=loop,
+    )
+    resp = await req._send(conn)
+    # The writer may have finished eagerly (Python 3.12+) since the
+    # already-expired deadline never suspends it.
+    if req._writer is not None:
+        await req._writer
+    assert reads == 1
+    assert buf.split(b"\r\n\r\n", 1)[1] == b"4\r\ntest\r\n0\r\n\r\n"
+    await req._close()
+    resp.close()
+
+
+async def test_expect100_timeout_100_continue_received(
+    buf: bytearray, conn: mock.Mock, make_client_request: _RequestMaker
+) -> None:
+    """Receiving 100-continue before the deadline sends the body normally."""
+    loop = asyncio.get_running_loop()
+    clock = _VirtualClock()  # never advanced: the deadline cannot expire
+    reads = 0
+
+    async def gen() -> AsyncIterator[bytes]:
+        nonlocal reads
+        reads += 1
+        yield b"test"
+
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=gen(),
+        expect100=True,
+        expect100_timeout=10.0,
+        expect100_clock=clock,
+        loop=loop,
+    )
+
+    async def coro() -> None:
+        await asyncio.sleep(0.0001)
+        assert req._continue is not None
+        req._continue.set_result(True)
+
+    t = loop.create_task(coro())
+    resp = await req._send(conn)
+    assert req._writer is not None
+    await req._writer
+    await t
+    assert reads == 1
+    assert buf.split(b"\r\n\r\n", 1)[1] == b"4\r\ntest\r\n0\r\n\r\n"
+    await req._close()
+    resp.close()
+
+
+async def test_expect100_final_response_stops_writer(
+    buf: bytearray, conn: mock.Mock, make_client_request: _RequestMaker
+) -> None:
+    """A final response before 100-continue stops the writer without reading the body."""
+    loop = asyncio.get_running_loop()
+    reads = 0
+
+    async def gen() -> AsyncIterator[bytes]:
+        nonlocal reads
+        reads += 1
+        yield b"test"
+
+    req = make_client_request(
+        "POST", URL("http://python.org/"), data=gen(), expect100=True, loop=loop
+    )
+    resp = await req._send(conn)
+    assert req._writer is not None
+
+    message = RawResponseMessage(
+        version=HttpVersion11,
+        code=417,
+        reason="Expectation Failed",
+        headers=HeadersDictProxy(CIMultiDict()),
+        raw_headers=(),
+        should_close=True,
+        compression=None,
+        upgrade=False,
+        chunked=False,
+    )
+    conn.protocol.read = mock.AsyncMock(return_value=(message, mock.Mock()))
+    await resp.start(conn)
+
+    # The pending wait was resolved as "do not send"...
+    assert resp._continue is None
+    # ...and the writer stopped without reading the body producer.
+    await req._writer
+    assert reads == 0
+    assert buf.split(b"\r\n\r\n", 1)[1] == b""
+    # The connection cannot be reused: the announced body was never sent.
+    conn.protocol.force_close.assert_called_once_with()
+    await asyncio.sleep(0)
+    assert req._writer is None
+    await req._close()
+    resp.close()
+
+
+async def test_expect100_timeout_policy_invalid(
+    make_client_request: _RequestMaker,
+) -> None:
+    """An unknown expect100 timeout policy is rejected eagerly."""
+    loop = asyncio.get_running_loop()
+    with pytest.raises(ValueError, match="expect100_timeout_policy"):
+        make_client_request(
+            "POST",
+            URL("http://python.org/"),
+            data=b"data",
+            expect100=True,
+            expect100_timeout=1.0,
+            expect100_timeout_policy="bogus",  # type: ignore[arg-type]
+            loop=loop,
+        )
 
 
 async def test_close(
