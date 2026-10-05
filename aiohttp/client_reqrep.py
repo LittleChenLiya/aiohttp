@@ -60,6 +60,7 @@ from .http import (
     StreamWriter,
 )
 from .streams import EMPTY_PAYLOAD, StreamReader
+from .text_decoder import ClientResponseTextDecoder
 from .typedefs import DEFAULT_JSON_DECODER, JSONDecoder, RawHeaders
 
 try:
@@ -743,6 +744,20 @@ class ClientResponse(HeadersMixin):
             encoding = self.get_encoding()
 
         return self._body.decode(encoding, errors=errors)  # type: ignore[union-attr]
+
+    def text_decoder(
+        self,
+        *,
+        encoding: str | None = None,
+        errors: str = "strict",
+    ) -> ClientResponseTextDecoder:
+        """Return an incremental decoding adapter over the response body.
+
+        The adapter decodes the payload chunk by chunk with the determined
+        charset (see :meth:`get_encoding`), yielding text pieces annotated
+        with their raw byte offsets, without buffering the whole body.
+        """
+        return ClientResponseTextDecoder(self, encoding=encoding, errors=errors)
 
     async def json(
         self,

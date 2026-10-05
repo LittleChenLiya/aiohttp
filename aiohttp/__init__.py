@@ -89,6 +89,12 @@ from .payload import (
 )
 from .resolver import AsyncResolver, DefaultResolver, ThreadedResolver
 from .streams import EMPTY_PAYLOAD, DataQueue, EofStream, StreamReader
+from .text_decoder import (
+    ClientResponseTextDecoder,
+    DecodedChunk,
+    TextStreamDecodeError,
+    TextStreamDecoder,
+)
 from .tracing import (
     TraceConfig,
     TraceConnectionCreateEndParams,
@@ -212,6 +218,11 @@ __all__: tuple[str, ...] = (
     "EMPTY_PAYLOAD",
     "EofStream",
     "StreamReader",
+    # text_decoder
+    "ClientResponseTextDecoder",
+    "DecodedChunk",
+    "TextStreamDecodeError",
+    "TextStreamDecoder",
     # tracing
     "TraceConfig",
     "TraceConnectionCreateEndParams",

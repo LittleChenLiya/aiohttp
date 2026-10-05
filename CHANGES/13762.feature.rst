@@ -1,0 +1,7 @@
+Added ``ClientResponse.text_decoder()`` and the ``aiohttp.text_decoder``
+module: an incremental text decoding adapter that converts small byte chunks
+into text using the determined charset, reports original raw byte offsets,
+handles BOMs and multi-byte characters spanning chunk boundaries, raises
+``TextStreamDecodeError`` with the first raw offset of an invalid sequence
+in strict mode, buffers only incomplete characters, and releases the
+response connection on failure, close, and EOF.
