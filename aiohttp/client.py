@@ -53,6 +53,7 @@ from .client_exceptions import (
     ClientSSLError,
     ConnectionTimeoutError,
     ContentTypeError,
+    Expect100TimeoutError,
     InvalidURL,
     InvalidUrlClientError,
     InvalidUrlRedirectClientError,

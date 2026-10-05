@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hashlib
 import io
 import pathlib
@@ -13,7 +14,7 @@ from multidict import CIMultiDict, CIMultiDictProxy, istr
 from yarl import URL
 
 import aiohttp
-from aiohttp import BaseConnector, hdrs, payload
+from aiohttp import BaseConnector, Expect100TimeoutError, hdrs, payload
 from aiohttp.abc import AbstractStreamWriter
 from aiohttp.base_protocol import BaseProtocol
 from aiohttp.client_exceptions import ClientConnectionError
@@ -23,12 +24,13 @@ from aiohttp.client_reqrep import (
     ClientResponse,
     ClientTimeout,
     Fingerprint,
+    _EXPECT100_TIMED_OUT,
     _gen_default_accept_encoding,
 )
 from aiohttp.compression_utils import ZLibBackend
 from aiohttp.connector import Connection
 from aiohttp.hdrs import METH_DELETE
-from aiohttp.helpers import HeadersDictProxy, TimerNoop
+from aiohttp.helpers import HeadersDictProxy, TimerNoop, set_result
 from aiohttp.http import HttpVersion10, HttpVersion11, StreamWriter
 from aiohttp.multipart import MultipartWriter
 
@@ -2120,6 +2122,267 @@ async def test_expect100_with_body_becomes_empty(
     req._body = payload.PAYLOAD_REGISTRY.get(b"", disposition=None)
 
     await req._write_bytes(mock_writer, mock_conn, None)
+
+
+# ---------------------------------------------------------------------------
+# Expect: 100-continue deadline (virtual clock)
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _virtual_expect100_clock(req: ClientRequest):
+    """Mock the expect-100 deadline timer with a virtual clock.
+
+    Yields a tuple ``(fire_deadline, handles)``:
+
+    ``fire_deadline``
+        A callable that fires the deadline callback (simulating the deadline
+        expiring) without waiting real time. It blocks until the writer task
+        has scheduled the timer, so the caller can fire it deterministically.
+
+    ``handles``
+        A list of the mock timer handles created, so tests can assert they
+        were cancelled on cleanup.
+    """
+    loop = req.loop
+    callbacks: list[Callable[[], None]] = []
+    handles: list[mock.Mock] = []
+    scheduled = asyncio.Event()
+    original_call_later = loop.call_later
+
+    def fake_call_later(delay: float, callback: Callable[..., None], *args: Any) -> Any:
+        # Only capture the expect-100 deadline timer; let other callers
+        # (e.g. asyncio.sleep) use the real clock.
+        if callback == req._on_expect100_timeout:
+            handle = mock.Mock()
+            handle.cancel = mock.Mock()
+            callbacks.append(callback)
+            handles.append(handle)
+            scheduled.set()
+            return handle
+        return original_call_later(delay, callback, *args)
+
+    with mock.patch.object(loop, "call_later", side_effect=fake_call_later):
+
+        async def fire_deadline() -> None:
+            # Wait until the writer task has scheduled the deadline timer.
+            await scheduled.wait()
+            assert callbacks, "No expect-100 deadline timer was scheduled"
+            cb = callbacks.pop(0)
+            cb()
+
+        yield fire_deadline, handles
+
+
+async def test_expect100_deadline_reject_policy(
+    buf: bytearray, conn: mock.Mock, make_client_request: _RequestMaker
+) -> None:
+    """Virtual deadline with reject policy: body is never sent, error raised."""
+    loop = asyncio.get_running_loop()
+    timeout = ClientTimeout(expect100=5.0, expect100_policy="reject")
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=b"data",
+        expect100=True,
+        loop=loop,
+        timeout=timeout,
+    )
+
+    async def fire() -> None:
+        await fire_deadline()
+
+    with _virtual_expect100_clock(req) as (fire_deadline, handles):
+        t = loop.create_task(fire())
+        resp = await req._send(conn)
+        assert req._writer is not None
+        await req._writer
+        await t
+
+    # The body producer must not have been read: the headers are buffered by
+    # send_headers(), but the body must not be present.
+    assert b"data" not in buf
+    # The deadline timer must have been released.
+    assert all(h.cancel.called for h in handles)
+    # The protocol was marked as failed so resp.start() raises.
+    assert conn.protocol.set_exception.called
+    args = conn.protocol.set_exception.call_args[0]
+    assert isinstance(args[0], Expect100TimeoutError)
+    await req._close()
+    resp.close()
+
+
+async def test_expect100_deadline_send_policy(
+    buf: bytearray, conn: mock.Mock, make_client_request: _RequestMaker
+) -> None:
+    """Virtual deadline with send policy: body is sent anyway."""
+    loop = asyncio.get_running_loop()
+    timeout = ClientTimeout(expect100=5.0, expect100_policy="send")
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=b"data",
+        expect100=True,
+        loop=loop,
+        timeout=timeout,
+    )
+
+    async def fire() -> None:
+        await fire_deadline()
+
+    with _virtual_expect100_clock(req) as (fire_deadline, handles):
+        t = loop.create_task(fire())
+        resp = await req._send(conn)
+        assert req._writer is not None
+        await req._writer
+        await t
+
+    # The body was sent after the deadline (send policy).
+    assert buf.split(b"\r\n\r\n", 1)[1] == b"data"
+    # The deadline timer must have been released.
+    assert all(h.cancel.called for h in handles)
+    await req._close()
+    resp.close()
+
+
+async def test_expect100_deadline_100_arrives_first(
+    buf: bytearray, conn: mock.Mock, make_client_request: _RequestMaker
+) -> None:
+    """100 Continue arrives before deadline: body is sent normally."""
+    loop = asyncio.get_running_loop()
+    timeout = ClientTimeout(expect100=5.0, expect100_policy="reject")
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=b"data",
+        expect100=True,
+        loop=loop,
+        timeout=timeout,
+    )
+
+    async def send_100() -> None:
+        await asyncio.sleep(0.0001)
+        assert req._continue is not None
+        req._continue.set_result(True)
+
+    with _virtual_expect100_clock(req) as (fire_deadline, handles):
+        t = loop.create_task(send_100())
+        resp = await req._send(conn)
+        assert req._writer is not None
+        await req._writer
+        await t
+
+    # The body was sent after the 100 Continue.
+    assert buf.split(b"\r\n\r\n", 1)[1] == b"data"
+    # The deadline timer must have been released (100 arrived first).
+    assert all(h.cancel.called for h in handles)
+    await req._close()
+    resp.close()
+
+
+async def test_expect100_deadline_final_response_arrives_first(
+    buf: bytearray, conn: mock.Mock, make_client_request: _RequestMaker
+) -> None:
+    """Final response arrives before deadline: body is never sent."""
+    loop = asyncio.get_running_loop()
+    timeout = ClientTimeout(expect100=5.0, expect100_policy="reject")
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=b"data",
+        expect100=True,
+        loop=loop,
+        timeout=timeout,
+    )
+
+    with _virtual_expect100_clock(req) as (fire_deadline, handles):
+        resp = await req._send(conn)
+        # Simulate a final response arriving before the deadline: cancel the
+        # deadline handle and mark the future (as ClientResponse.start() does).
+        resp._cancel_expect100_deadline()
+        # Fire a late 100: it must not restart the writer.
+        set_result(req._continue, True)
+        # The writer must not have sent the body (headers only).
+        assert b"data" not in buf
+        # The writer is parked waiting for release; cancel it before close.
+        req._terminate()
+        resp.close()
+
+    # No timer was left running.
+    assert all(h.cancel.called for h in handles)
+
+
+async def test_expect100_late_100_does_not_restart_cancelled_writer(
+    buf: bytearray, conn: mock.Mock, make_client_request: _RequestMaker
+) -> None:
+    """A late 100 Continue cannot restart a writer cancelled by rejection."""
+    loop = asyncio.get_running_loop()
+    timeout = ClientTimeout(expect100=5.0, expect100_policy="reject")
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=b"data",
+        expect100=True,
+        loop=loop,
+        timeout=timeout,
+    )
+
+    async def fire() -> None:
+        await fire_deadline()
+
+    with _virtual_expect100_clock(req) as (fire_deadline, handles):
+        t = loop.create_task(fire())
+        resp = await req._send(conn)
+        assert req._writer is not None
+        await req._writer
+        await t
+
+    # The writer completed (rejected) without sending the body (headers only).
+    assert b"data" not in buf
+    # The future holds the timeout sentinel; a late 100 cannot overwrite it.
+    assert req._continue is not None
+    assert req._continue.done()
+    assert req._continue.result() is _EXPECT100_TIMED_OUT
+    # Even if a late 100 arrives, the safe set_result helper is a no-op
+    # because the future is already done; the body must not be sent.
+    set_result(req._continue, True)
+    assert b"data" not in buf
+    await req._close()
+    resp.close()
+
+
+async def test_expect100_no_deadline_waits_indefinitely(
+    buf: bytearray, conn: mock.Mock, make_client_request: _RequestMaker
+) -> None:
+    """Without a deadline the handshake waits until 100 arrives (default)."""
+    loop = asyncio.get_running_loop()
+    # Default ClientTimeout has expect100=None.
+    req = make_client_request(
+        "POST",
+        URL("http://python.org/"),
+        data=b"data",
+        expect100=True,
+        loop=loop,
+    )
+
+    async def send_100() -> None:
+        await asyncio.sleep(0.0001)
+        assert req._continue is not None
+        req._continue.set_result(True)
+
+    with _virtual_expect100_clock(req) as (fire_deadline, handles):
+        t = loop.create_task(send_100())
+        resp = await req._send(conn)
+        assert req._writer is not None
+        await req._writer
+        await t
+
+    # No deadline timer was scheduled (default behaviour).
+    assert handles == []
+    # The body was sent after the 100 Continue.
+    assert buf.split(b"\r\n\r\n", 1)[1] == b"data"
+    await req._close()
+    resp.close()
 
 
 @pytest.mark.parametrize(

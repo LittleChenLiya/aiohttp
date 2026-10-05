@@ -30,6 +30,7 @@ from .client_exceptions import (
     ClientOSError,
     ClientResponseError,
     ContentTypeError,
+    Expect100TimeoutError,
     InvalidURL,
     ServerFingerprintMismatch,
 )
@@ -92,6 +93,17 @@ class ClientTimeout:
     sock_read: float | None = None
     sock_connect: float | None = None
     ceil_threshold: float = 5
+    # Optional deadline for the Expect: 100-continue handshake.
+    # ``None`` means wait indefinitely (the historical default). When set,
+    # the client waits at most this long for a ``100 Continue`` response;
+    # what happens on expiry is governed by :attr:`expect100_policy`.
+    expect100: float | None = None
+    # Policy when the :attr:`expect100` deadline expires without a
+    # ``100 Continue`` or a final response:
+    # - ``"send"``: send the request body anyway (continue the upload).
+    # - ``"reject"``: reject the upload, raise :class:`Expect100TimeoutError`
+    #   and do not read or send the body producer.
+    expect100_policy: Literal["send", "reject"] = "send"
 
     # pool_queue_timeout: Optional[float] = None
     # dns_resolution_timeout: Optional[float] = None
@@ -215,6 +227,11 @@ else:  # pragma: no cover
 
 _CONNECTION_CLOSED_EXCEPTION = ClientConnectionError("Connection closed")
 _SSL_SCHEMES = frozenset(("https", "wss"))
+# Sentinel result used to mark the expect-100 deadline firing on the
+# ``_continue`` future. A late ``100 Continue`` cannot overwrite it because
+# ``Future.set_result`` is a no-op once the future is done, so a canceled
+# writer is never restarted by a late 100.
+_EXPECT100_TIMED_OUT = object()
 
 
 # ConnectionKey is a NamedTuple because it is used as a key in a dict
@@ -542,6 +559,11 @@ class ClientResponse(HeadersMixin):
                     set_result(self._continue, True)
                     self._continue = None
 
+        # A final response arrived without a 100-continue. The body must not
+        # be sent, so cancel the expect-100 deadline timer (if it exists) and
+        # mark the future so a late 100 cannot restart the writer.
+        self._cancel_expect100_deadline()
+
         # payload eof handler
         payload.on_eof(self._response_eof)
 
@@ -566,6 +588,23 @@ class ClientResponse(HeadersMixin):
             # Store raw cookie headers for CookieJar
             self._raw_cookie_headers = tuple(cookie_hdrs)
         return self
+
+    def _cancel_expect100_deadline(self) -> None:
+        """Cancel the expect-100 deadline timer if a final response arrived.
+
+        Called from :meth:`start` when a final (non-1xx) response is received
+        before the deadline. The body producer must not be read, so the timer
+        is cancelled and the future is marked. A late ``100 Continue`` cannot
+        restart a writer that has been parked by this flag.
+        """
+        if self._continue is None:
+            return
+        handle = getattr(self._continue, "_expect100_handle", None)
+        if handle is not None:
+            handle.cancel()
+        # Mark the future so the writer (which may not have started waiting
+        # yet) knows a final response was received and must not send the body.
+        self._continue._expect100_final = True  # type: ignore[attr-defined]
 
     def _response_eof(self) -> None:
         if self._closed:
@@ -1493,7 +1532,16 @@ class ClientRequest(ClientRequestBase):
             # Force headers to be sent before waiting for 100-continue
             writer.send_headers()
             await writer.drain()
-            await self._continue
+            try:
+                await self._wait_continue()
+            except Expect100TimeoutError as exc:
+                # Reject policy: the deadline expired without a 100 Continue
+                # or a final response. Do not read or send the body producer.
+                # Mark the protocol as failed so resp.start() raises instead
+                # of hanging waiting for a response that will never come.
+                protocol = conn.protocol
+                set_exception(protocol, exc)
+                return
 
         protocol = conn.protocol
         assert protocol is not None
@@ -1530,6 +1578,73 @@ class ClientRequest(ClientRequestBase):
             # Successfully wrote the body, signal EOF and start response timeout
             await writer.write_eof()
             protocol.start_timeout()
+
+    async def _wait_continue(self) -> None:
+        """Wait for a 100-continue response, honouring the optional deadline.
+
+        When no :attr:`ClientTimeout.expect100` deadline is configured, this
+        waits indefinitely, preserving the historical handshake behaviour.
+
+        When a deadline is configured, the wait is bounded by it. If a
+        ``100 Continue`` arrives first, the body is sent. If a final response
+        arrives first, the body is never sent (the response is returned to the
+        caller). If the deadline expires first, the configured policy decides:
+        ``"send"`` writes the body anyway, ``"reject"`` raises
+        :class:`Expect100TimeoutError` without touching the body producer.
+
+        All timers and writer references are released on exit: the deadline
+        handle is cancelled in ``finally`` and a late ``100 Continue`` cannot
+        restart a cancelled writer because the future can only be set once.
+        """
+        deadline = self._timeout.expect100
+        if deadline is None:
+            await self._continue
+            return
+
+        loop = self.loop
+        # A final response may have arrived before the writer task got around
+        # to waiting. In that case the response already cancelled the deadline
+        # handle (and marked the future), so we must not wait or send.
+        if getattr(self._continue, "_expect100_final", False):
+            # Park until the response is released and the writer is cancelled.
+            # The body producer is never read because we never reach
+            # write_with_length().
+            await loop.create_future()
+            return
+
+        handle = loop.call_later(deadline, self._on_expect100_timeout)
+        # Expose the handle so ClientResponse.start() can cancel it if a final
+        # response arrives before the deadline.
+        self._continue._expect100_handle = handle  # type: ignore[attr-defined]
+        try:
+            result = await self._continue
+        finally:
+            handle.cancel()
+            with contextlib.suppress(AttributeError):
+                del self._continue._expect100_handle  # type: ignore[attr-defined]
+
+        if getattr(self._continue, "_expect100_final", False):
+            # A final response arrived while we were waiting. The body must
+            # not be sent; park until release.
+            await loop.create_future()
+            return
+
+        if result is _EXPECT100_TIMED_OUT:
+            if self._timeout.expect100_policy == "reject":
+                raise Expect100TimeoutError(
+                    f"Expect 100-continue timed out after {deadline !s}s "
+                    f"for {self.url !s}"
+                )
+            # "send" policy: fall through and write the body.
+
+    def _on_expect100_timeout(self) -> None:
+        """Fire the expect-100 deadline by setting the sentinel result.
+
+        A late ``100 Continue`` cannot overwrite the sentinel because
+        ``Future.set_result`` is a no-op once the future is done.
+        """
+        if not self._continue.done():
+            self._continue.set_result(_EXPECT100_TIMED_OUT)
 
     async def _close(self) -> None:
         if self._writer_task is not None:

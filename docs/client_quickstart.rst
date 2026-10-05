@@ -468,13 +468,28 @@ Supported :class:`ClientTimeout` fields are:
 
       The threshold value to trigger ceiling of absolute timeout values.
 
+    ``expect100``
+
+      Optional deadline (in seconds) for the ``Expect: 100-continue``
+      handshake. ``None`` (the default) means wait indefinitely. When set,
+      the client waits at most this long for a ``100 Continue`` response;
+      the behaviour on expiry is governed by ``expect100_policy``.
+
+    ``expect100_policy``
+
+      Policy when the ``expect100`` deadline expires without a
+      ``100 Continue`` or a final response. ``"send"`` (the default) sends
+      the body anyway; ``"reject"`` raises :class:`Expect100TimeoutError`
+      without reading the body producer.
+
 All fields are floats, ``None`` or ``0`` disables a particular timeout check, see the
 :class:`ClientTimeout` reference for defaults and additional details.
 
 Thus the default timeout is::
 
    aiohttp.ClientTimeout(total=5*60, connect=None,
-                         sock_connect=None, sock_read=None, ceil_threshold=5)
+                         sock_connect=None, sock_read=None, ceil_threshold=5,
+                         expect100=None, expect100_policy='send')
 
 .. note::
 
@@ -493,3 +508,38 @@ Thus the default timeout is::
    Smaller timeouts are not rounded to help testing; in the real life network
    timeouts usually greater than tens of seconds. However, the default threshold
    value of 5 seconds can be configured using the ``ceil_threshold`` parameter.
+
+
+Expect: 100-continue deadline
+=============================
+
+When using ``expect100=True``, the client sends an ``Expect: 100-continue``
+header and waits for a ``100 Continue`` response before sending the body. By
+default the wait is unbounded, but an optional deadline can be configured via
+:attr:`ClientTimeout.expect100`.
+
+When the deadline expires without a ``100 Continue`` or a final response, the
+:attr:`ClientTimeout.expect100_policy` decides what happens:
+
+- ``"send"`` (default): send the request body anyway (continue the upload).
+- ``"reject"``: reject the upload, raise :class:`Expect100TimeoutError` and do
+  not read or send the body producer.
+
+Example::
+
+    timeout = aiohttp.ClientTimeout(expect100=5.0, expect100_policy="reject")
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.post(url, data=payload, expect100=True) as resp:
+                ...
+        except aiohttp.Expect100TimeoutError:
+            # The body producer was never read.
+            ...
+
+If a final response (e.g. ``417 Expectation Failed``) arrives before the
+deadline, the body is never sent and the response is returned to the caller
+normally. The deadline timer is released and a late ``100 Continue`` cannot
+restart the cancelled writer.
+
+When no ``expect100`` deadline is configured (the default), the handshake
+waits indefinitely, preserving the historical behaviour.

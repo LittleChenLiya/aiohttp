@@ -2214,7 +2214,8 @@ Utilities
 
 
 .. class:: ClientTimeout(*, total=5*60, connect=None, \
-                         sock_connect=None, sock_read=None)
+                         sock_connect=None, sock_read=None, \
+                         expect100=None, expect100_policy='send')
    :canonical: aiohttp.client.ClientTimeout
 
    A data class for client timeout settings.
@@ -2251,6 +2252,30 @@ Utilities
       Maximal number of seconds for reading a portion of data from a peer.
 
       :class:`float`, ``None`` by default.
+
+   .. attribute:: expect100
+
+      Optional deadline for the ``Expect: 100-continue`` handshake.
+
+      When ``None`` (the default), the client waits indefinitely for a
+      ``100 Continue`` response, preserving the historical behaviour.
+      When set to a positive number of seconds, the wait is bounded by
+      this deadline. What happens on expiry is governed by
+      :attr:`expect100_policy`.
+
+      :class:`float`, ``None`` by default.
+
+   .. attribute:: expect100_policy
+
+      Policy when the :attr:`expect100` deadline expires without a
+      ``100 Continue`` or a final response:
+
+      - ``"send"``: send the request body anyway (continue the upload).
+      - ``"reject"``: reject the upload, raise
+        :class:`Expect100TimeoutError` and do not read or send the body
+        producer.
+
+      :class:`str`, ``"send"`` by default.
 
 
 .. class:: ClientWSTimeout(*, ws_receive=None, ws_close=None)

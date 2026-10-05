@@ -2371,6 +2371,122 @@ async def test_expect100_continue_with_none_payload(
     assert expect_received
 
 
+async def _no_expect_handler(request: web.Request) -> None:
+    """Expect handler that does NOT send 100 Continue.
+
+    Used to test deadline behaviour where the server withholds 100 Continue.
+    """
+
+
+async def test_expect100_417_directly_body_not_sent(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Server returns 417 directly: body producer is never read."""
+    read_count = 0
+
+    async def data_gen() -> AsyncIterator[bytes]:
+        nonlocal read_count
+        read_count += 1
+        yield b"some data"
+
+    async def handler(request: web.Request) -> web.Response:
+        return web.Response(status=417)
+
+    app = web.Application()
+    app.router.add_post("/", handler, expect_handler=_no_expect_handler)
+    client = await aiohttp_client(app)
+
+    async with client.post("/", data=data_gen(), expect100=True) as resp:
+        assert resp.status == 417
+    assert read_count == 0
+
+
+async def test_expect100_deadline_reject_body_not_sent(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Deadline with reject policy: body producer is never read."""
+    read_count = 0
+
+    async def data_gen() -> AsyncIterator[bytes]:
+        nonlocal read_count
+        read_count += 1
+        yield b"some data"
+
+    async def handler(request: web.Request) -> web.Response:
+        # Never send 100 Continue; the deadline will fire instead.
+        # Block reading the body (the client never sends it).
+        await request.read()
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_post("/", handler, expect_handler=_no_expect_handler)
+    timeout = aiohttp.ClientTimeout(expect100=0.1, expect100_policy="reject")
+    client = await aiohttp_client(app, timeout=timeout)
+
+    with pytest.raises(aiohttp.Expect100TimeoutError):
+        async with client.post("/", data=data_gen(), expect100=True) as resp:
+            pass
+    assert read_count == 0
+
+
+async def test_expect100_100_arrives_body_sent(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """100 Continue arrives before deadline: body is sent normally."""
+    read_count = 0
+
+    async def data_gen() -> AsyncIterator[bytes]:
+        nonlocal read_count
+        read_count += 1
+        yield b"some data"
+
+    async def handler(request: web.Request) -> web.Response:
+        data = await request.read()
+        assert data == b"some data"
+        return web.Response()
+
+    async def expect_handler(request: web.Request) -> None:
+        assert request.transport is not None
+        request.transport.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+
+    app = web.Application()
+    app.router.add_post("/", handler, expect_handler=expect_handler)
+    timeout = aiohttp.ClientTimeout(expect100=5.0, expect100_policy="reject")
+    client = await aiohttp_client(app, timeout=timeout)
+
+    async with client.post("/", data=data_gen(), expect100=True) as resp:
+        assert resp.status == 200
+    assert read_count == 1
+
+
+async def test_expect100_deadline_send_policy_body_sent(
+    aiohttp_client: AiohttpClient,
+) -> None:
+    """Deadline with send policy: body is sent after deadline expires."""
+    read_count = 0
+
+    async def data_gen() -> AsyncIterator[bytes]:
+        nonlocal read_count
+        read_count += 1
+        yield b"some data"
+
+    async def handler(request: web.Request) -> web.Response:
+        # Never send 100 Continue; the deadline will fire instead.
+        # Read the body (blocks until the client sends it after the deadline).
+        data = await request.read()
+        assert data == b"some data"
+        return web.Response()
+
+    app = web.Application()
+    app.router.add_post("/", handler, expect_handler=_no_expect_handler)
+    timeout = aiohttp.ClientTimeout(expect100=0.1, expect100_policy="send")
+    client = await aiohttp_client(app, timeout=timeout)
+
+    async with client.post("/", data=data_gen(), expect100=True) as resp:
+        assert resp.status == 200
+    assert read_count == 1
+
+
 @pytest.mark.usefixtures("parametrize_zlib_backend")
 async def test_encoding_deflate(
     aiohttp_client: AiohttpClient,

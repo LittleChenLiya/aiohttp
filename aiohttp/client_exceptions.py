@@ -32,6 +32,7 @@ __all__ = (
     "ClientConnectorCertificateError",
     "ConnectionTimeoutError",
     "SocketTimeoutError",
+    "Expect100TimeoutError",
     "ServerConnectionError",
     "ServerTimeoutError",
     "ServerDisconnectedError",
@@ -239,6 +240,16 @@ class ConnectionTimeoutError(ServerTimeoutError):
 
 class SocketTimeoutError(ServerTimeoutError):
     """Socket timeout error."""
+
+
+class Expect100TimeoutError(ServerTimeoutError):
+    """Expect 100-continue handshake timed out.
+
+    Raised when the client asked for ``100-continue``, the configured
+    ``expect100`` deadline elapsed without either a ``100 Continue`` or a
+    final response, and the policy is to reject the upload instead of
+    sending the body anyway.
+    """
 
 
 class ServerFingerprintMismatch(ServerConnectionError):
