@@ -1,7 +1,10 @@
 import asyncio
+import base64
 import codecs
 import contextlib
 import functools
+import hashlib
+import hmac
 import io
 import re
 import sys
@@ -29,6 +32,7 @@ from .client_exceptions import (
     ClientConnectionError,
     ClientOSError,
     ClientResponseError,
+    ContentDigestError,
     ContentTypeError,
     InvalidURL,
     ServerFingerprintMismatch,
@@ -37,6 +41,8 @@ from .compression_utils import HAS_BROTLI, HAS_ZSTD
 from .formdata import FormData
 from .helpers import (
     _SENTINEL,
+    EMPTY_BODY_METHODS,
+    EMPTY_BODY_STATUS_CODES,
     HTTP_AND_EMPTY_SCHEMA_SET,
     BaseTimerContext,
     HeadersDictProxy,
@@ -76,6 +82,7 @@ __all__ = ("ClientRequest", "ClientResponse", "RequestInfo", "Fingerprint")
 if TYPE_CHECKING:
     from .client import ClientSession
     from .connector import Connection
+    from .http_parser import _PayloadHasher
     from .tracing import Trace
 
 
@@ -237,12 +244,43 @@ class ResponseParams(TypedDict):
     skip_payload: bool
     read_until_eof: bool
     auto_decompress: bool
+    verify_response_digest: bool
     read_timeout: float | None
     read_bufsize: int
     timeout_ceil_threshold: float
     max_line_size: int
     max_field_size: int
     max_headers: int
+
+
+def _parse_content_digest_sha256(header_value: str) -> bytes | None:
+    """Extract the sha-256 digest from a Content-Digest header (RFC 9530).
+
+    Returns the expected digest, or ``None`` when the header carries no
+    sha-256 entry (other algorithms are not supported and are ignored).
+    Raises ``ValueError`` when a sha-256 entry is present but malformed.
+    """
+    expected: bytes | None = None
+    for member in header_value.split(","):
+        key, sep, value = member.partition("=")
+        if key.strip().lower() != "sha-256":
+            continue
+        if expected is not None:
+            raise ValueError("duplicate sha-256 entry")
+        if not sep:
+            raise ValueError("missing sha-256 value")
+        # Ignore any parameters: sha-256=:abc:;key=param
+        value = value.split(";", 1)[0].strip()
+        if len(value) < 2 or not value.startswith(":") or not value.endswith(":"):
+            raise ValueError("sha-256 value is not a byte sequence")
+        try:
+            digest = base64.b64decode(value[1:-1], validate=True)
+        except ValueError:
+            raise ValueError("sha-256 value is not valid base64") from None
+        if len(digest) != hashlib.sha256().digest_size:
+            raise ValueError("sha-256 value has an invalid length")
+        expected = digest
+    return expected
 
 
 class ClientResponse(HeadersMixin):
@@ -272,6 +310,13 @@ class ClientResponse(HeadersMixin):
     _closed = True  # to allow __del__ for non-initialized properly response
     _released = False
     _in_context = False
+
+    # Response digest verification (RFC 9530 Content-Digest), opt-in via
+    # ClientSession(verify_response_digest=...). _payload_digest is fed by
+    # the HTTP parser with the payload bytes as received on the wire (after
+    # transfer-decoding, before decompression); None when not enabled.
+    _payload_digest: "_PayloadHasher | None" = None
+    _require_response_digest = False
 
     _resolve_charset: Callable[["ClientResponse", bytes], str] = lambda *_: "utf-8"
 
@@ -558,6 +603,10 @@ class ClientResponse(HeadersMixin):
         # payload
         self.content = payload
 
+        # Pick up the hasher the parser feeds while the payload is received
+        # when response digest verification is enabled; None otherwise.
+        self._payload_digest = getattr(self._protocol, "payload_digest", None)
+
         if self._traces and payload is not EMPTY_PAYLOAD:
             payload._on_chunk_received = self._on_chunk_response_received
 
@@ -701,6 +750,7 @@ class ClientResponse(HeadersMixin):
         if self._body is None:
             try:
                 self._body = await self.content.read()
+                self._verify_response_digest()
             except BaseException:
                 self.close()
                 raise
@@ -711,6 +761,66 @@ class ClientResponse(HeadersMixin):
         if protocol is None or not protocol.upgraded:
             await self._wait_released()  # Underlying connection released
         return self._body
+
+    def _verify_response_digest(self) -> None:
+        """Verify the received payload against the Content-Digest header.
+
+        Does nothing unless response digest verification was enabled for
+        this request. Raises ContentDigestError when the sha-256 of the
+        payload bytes (as received on the wire, after transfer-decoding and
+        before decompression) does not match the header, when the header is
+        malformed, or -- only with require_response_digest -- when no
+        supported digest was provided at all.
+        """
+        hasher = self._payload_digest
+        if hasher is None:
+            return
+        if (
+            self.method in EMPTY_BODY_METHODS
+            or self.status in EMPTY_BODY_STATUS_CODES
+        ):
+            # No payload is allowed on these exchanges; Content-Digest then
+            # describes the (absent) representation, not the message payload.
+            return
+        header = self.headers.get(hdrs.CONTENT_DIGEST)
+        expected: bytes | None = None
+        if header is not None:
+            try:
+                expected = _parse_content_digest_sha256(header)
+            except ValueError as exc:
+                raise ContentDigestError(
+                    self.request_info,
+                    self.history,
+                    status=self.status,
+                    message=f"Malformed Content-Digest header: {exc}",
+                    headers=self.headers,
+                ) from exc
+        if expected is None:
+            if self._require_response_digest:
+                raise ContentDigestError(
+                    self.request_info,
+                    self.history,
+                    status=self.status,
+                    message=(
+                        "Content-Digest header with a supported digest "
+                        "algorithm (sha-256) is required but was not provided"
+                    ),
+                    headers=self.headers,
+                )
+            return
+        actual = hasher.digest()
+        if not hmac.compare_digest(actual, expected):
+            raise ContentDigestError(
+                self.request_info,
+                self.history,
+                status=self.status,
+                message=(
+                    "Content-Digest sha-256 mismatch: expected "
+                    f"{base64.b64encode(expected).decode()}, got "
+                    f"{base64.b64encode(actual).decode()}"
+                ),
+                headers=self.headers,
+            )
 
     def get_encoding(self) -> str:
         ctype = self.headers.get(hdrs.CONTENT_TYPE, "").lower()

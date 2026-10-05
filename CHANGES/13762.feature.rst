@@ -1,0 +1,8 @@
+Added opt-in verification of the response payload against the ``sha-256``
+entry of the ``Content-Digest`` header (:rfc:`9530`) via the new
+``verify_response_digest`` and ``require_response_digest`` arguments of
+:class:`aiohttp.ClientSession` and its request methods. The digest is
+computed over the payload bytes as received on the wire (after chunked
+transfer decoding, before automatic decompression); a mismatch, a
+malformed header, or -- when required -- a missing supported digest
+raises :exc:`aiohttp.ContentDigestError` while reading the response body.

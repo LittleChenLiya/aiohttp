@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import suppress
-from typing import Callable, Protocol
+from typing import TYPE_CHECKING, Callable, Protocol
 
 from ._websocket.reader import WebSocketDataQueue
 from .base_protocol import BaseProtocol
@@ -23,6 +23,9 @@ from .helpers import (
 from .http import HttpResponseParser, RawResponseMessage, WebSocketReader
 from .http_exceptions import HttpProcessingError
 from .streams import EMPTY_PAYLOAD, DataQueue, StreamReader
+
+if TYPE_CHECKING:
+    from .http_parser import _PayloadHasher
 
 
 class _Payload(ErrorableProtocol, Protocol):
@@ -250,6 +253,7 @@ class ResponseHandler(BaseProtocol, DataQueue[tuple[RawResponseMessage, StreamRe
         skip_payload: bool = False,
         read_until_eof: bool = False,
         auto_decompress: bool = True,
+        verify_response_digest: bool = False,
         read_timeout: float | None = None,
         read_bufsize: int = DEFAULT_CHUNK_SIZE,
         timeout_ceil_threshold: float = 5,
@@ -273,12 +277,25 @@ class ResponseHandler(BaseProtocol, DataQueue[tuple[RawResponseMessage, StreamRe
             response_with_body=not skip_payload,
             read_until_eof=read_until_eof,
             auto_decompress=auto_decompress,
+            compute_payload_digest=verify_response_digest,
             max_line_size=max_line_size,
             max_field_size=max_field_size,
             max_headers=max_headers,
         )
 
         self._drain_tail()
+
+    @property
+    def payload_digest(self) -> "_PayloadHasher | None":
+        """The hasher fed with the current response's payload bytes.
+
+        Only set when response digest verification was requested via
+        ``set_response_params``; ``None`` otherwise.
+        """
+        parser = self._parser
+        if parser is None:
+            return None
+        return getattr(parser, "payload_digest", None)
 
     def _drop_timeout(self) -> None:
         if self._read_timeout_handle is not None:

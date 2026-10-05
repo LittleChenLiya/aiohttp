@@ -1,5 +1,6 @@
 import abc
 import asyncio
+import hashlib
 import re
 import string
 import sys
@@ -14,6 +15,7 @@ from typing import (
     Generic,
     Literal,
     NamedTuple,
+    Protocol,
     TypeVar,
 )
 
@@ -70,6 +72,15 @@ __all__ = (
 _T = TypeVar("_T")
 
 _SEP = Literal[b"\r\n", b"\n"]
+
+
+class _PayloadHasher(Protocol):
+    """Structural type of the hash object fed with raw payload bytes."""
+
+    def update(self, data: bytes) -> None: ...
+
+    def digest(self) -> bytes: ...
+
 
 ASCIISET: Final[set[str]] = set(string.printable)
 
@@ -268,6 +279,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
         read_until_eof: bool = False,
         auto_decompress: bool = True,
         max_msg_queue_size: int = 0,
+        compute_payload_digest: bool = False,
     ) -> None:
         self.protocol = protocol
         self.loop = loop
@@ -294,6 +306,10 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
         # Stop emitting messages once this many are queued unconsumed (0 = off).
         self._max_msg_queue_size = max_msg_queue_size
         self._msg_in_flight = 0
+        # Opt-in sha-256 of the payload bytes as received on the wire (after
+        # transfer-decoding, before decompression), for Content-Digest checks.
+        self._compute_payload_digest = compute_payload_digest
+        self.payload_digest: "_PayloadHasher | None" = None
 
     @abc.abstractmethod
     def parse_message(self, lines: list[bytes]) -> _MsgT: ...
@@ -396,6 +412,13 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                         finally:
                             self._lines.clear()
 
+                        if self._compute_payload_digest:
+                            # Start a fresh sha-256 for every message; it is
+                            # updated with the payload bytes as received on the
+                            # wire (after transfer-decoding, before any
+                            # decompression) so Content-Digest can be verified.
+                            self.payload_digest = hashlib.sha256()
+
                         def get_content_length() -> int | None:
                             # payload length
                             length_hdr = msg.headers.get(CONTENT_LENGTH)
@@ -454,6 +477,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 max_field_size=self.max_field_size,
                                 max_trailers=max_trailers,
                                 limit=self._limit,
+                                payload_digest=self.payload_digest,
                             )
                             if not payload_parser.done:
                                 self._payload_parser = payload_parser
@@ -504,6 +528,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
                                 max_field_size=self.max_field_size,
                                 max_trailers=max_trailers,
                                 limit=self._limit,
+                                payload_digest=self.payload_digest,
                             )
                             if not payload_parser.done:
                                 self._payload_parser = payload_parser
@@ -868,6 +893,7 @@ class HttpPayloadParser:
         max_field_size: int = 8190,
         max_trailers: int = 128,
         limit: int = DEFAULT_CHUNK_SIZE,
+        payload_digest: "_PayloadHasher | None" = None,
     ) -> None:
         self._length = 0
         self._paused = False
@@ -877,6 +903,7 @@ class HttpPayloadParser:
         self._chunk_tail = b""
         self._auto_decompress = auto_decompress
         self._lax = lax
+        self._payload_digest = payload_digest
         self._headers_parser = headers_parser
         self._max_line_size = max_line_size
         self._max_field_size = max_field_size
@@ -966,6 +993,8 @@ class HttpPayloadParser:
 
             required = self._length
             self._length = max(required - len(chunk), 0)
+            if self._payload_digest is not None:
+                self._payload_digest.update(chunk[:required])
             self._more_data_available = self.payload.feed_data(chunk[:required])
             while self._more_data_available:
                 if self._paused:
@@ -1054,6 +1083,8 @@ class HttpPayloadParser:
 
                     required = self._chunk_size
                     self._chunk_size = max(required - len(chunk), 0)
+                    if self._payload_digest is not None:
+                        self._payload_digest.update(chunk[:required])
                     self._more_data_available = self.payload.feed_data(chunk[:required])
                     chunk = chunk[required:]
 
@@ -1123,6 +1154,8 @@ class HttpPayloadParser:
 
         # Read all bytes until eof
         elif self._type == ParseState.PARSE_UNTIL_EOF:
+            if self._payload_digest is not None:
+                self._payload_digest.update(chunk)
             self._more_data_available = self.payload.feed_data(chunk)
             while self._more_data_available:
                 if self._paused:

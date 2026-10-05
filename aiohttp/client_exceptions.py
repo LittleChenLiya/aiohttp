@@ -40,6 +40,7 @@ __all__ = (
     "ClientHttpProxyError",
     "WSServerHandshakeError",
     "ContentTypeError",
+    "ContentDigestError",
     "ClientPayloadError",
     "InvalidURL",
     "InvalidUrlClientError",
@@ -102,6 +103,10 @@ class ClientResponseError(ClientError):
 
 class ContentTypeError(ClientResponseError):
     """ContentType found is not valid."""
+
+
+class ContentDigestError(ClientResponseError):
+    """Response payload does not match the Content-Digest header."""
 
 
 class WSServerHandshakeError(ClientResponseError):

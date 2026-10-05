@@ -13,6 +13,8 @@ from cpython.mem cimport PyMem_Free, PyMem_Malloc
 from libc.limits cimport ULLONG_MAX
 from libc.string cimport memcpy
 
+from hashlib import sha256 as _sha256
+
 from multidict import CIMultiDict as _CIMultiDict
 from yarl import URL as _URL
 
@@ -345,6 +347,8 @@ cdef class HttpParser:
         object  _last_error
         bint    _auto_decompress
         int     _limit
+        bint    _compute_payload_digest
+        readonly object payload_digest
 
         str     _content_encoding
 
@@ -374,6 +378,7 @@ cdef class HttpParser:
         bint response_with_body=True, bint read_until_eof=False,
         bint auto_decompress=True,
         Py_ssize_t max_msg_queue_size=0,
+        bint compute_payload_digest=False,
     ):
         cparser.llhttp_settings_init(self._csettings)
         cparser.llhttp_init(self._cparser, mode, self._csettings)
@@ -427,6 +432,8 @@ cdef class HttpParser:
 
         self._last_error = None
         self._limit = limit
+        self._compute_payload_digest = compute_payload_digest
+        self.payload_digest = None
 
     cdef _process_header(self):
         cdef str value
@@ -483,6 +490,12 @@ cdef class HttpParser:
         cdef str enc
 
         self._process_header()
+
+        if self._compute_payload_digest:
+            # Fresh sha-256 per message, fed with the payload bytes as
+            # received on the wire (after transfer-decoding, before
+            # decompression) so Content-Digest can be verified.
+            self.payload_digest = _sha256()
 
         http_version = self.http_version()
         should_close = not cparser.llhttp_should_keep_alive(self._cparser)
@@ -794,12 +807,12 @@ cdef class HttpResponseParser(HttpParser):
             size_t max_line_size=8190, size_t max_headers=128,
             size_t max_field_size=8190, payload_exception=None,
             bint response_with_body=True, bint read_until_eof=False,
-            bint auto_decompress=True
+            bint auto_decompress=True, bint compute_payload_digest=False
     ):
         self._init(cparser.HTTP_RESPONSE, protocol, loop, limit, timer,
                    max_line_size, max_headers, max_field_size,
                    payload_exception, response_with_body, read_until_eof,
-                   auto_decompress)
+                   auto_decompress, 0, compute_payload_digest)
         # Use strict parsing on dev mode, so users are warned about broken servers.
         if not DEBUG:
             cparser.llhttp_set_lenient_headers(self._cparser, 1)
@@ -911,6 +924,8 @@ cdef int cb_on_body(cparser.llhttp_t* parser,
                     const char *at, size_t length) except? -1:
     cdef HttpParser pyparser = <HttpParser>parser.data
     cdef bytes body = at[:length]
+    if pyparser.payload_digest is not None:
+        pyparser.payload_digest.update(body)
     while body or pyparser._more_data_available:
         try:
             pyparser._more_data_available = pyparser._payload.feed_data(body)

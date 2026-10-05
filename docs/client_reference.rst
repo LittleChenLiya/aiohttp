@@ -50,6 +50,8 @@ The client session supports the context manager protocol for self closing.
                          raise_for_status=False, \
                          timeout=sentinel, \
                          auto_decompress=True, \
+                         verify_response_digest=False, \
+                         require_response_digest=False, \
                          ssl=True, \
                          trust_env=False, \
                          requote_redirect_url=True, \
@@ -173,6 +175,24 @@ The client session supports the context manager protocol for self closing.
    :param bool auto_decompress: Automatically decompress response body (``True`` by default).
 
       .. versionadded:: 2.3
+
+   :param bool verify_response_digest: Verify the response payload against
+      the ``sha-256`` entry of the :mailheader:`Content-Digest` header
+      (:rfc:`9530`) when the server provides one. The digest is computed
+      over the payload bytes exactly as received on the wire, i.e. after
+      transfer (chunked) decoding but before any automatic decompression.
+      A mismatch raises :exc:`aiohttp.ContentDigestError` when the response
+      body is read. Responses without a supported digest entry are skipped
+      unless *require_response_digest* is enabled (``False`` by default).
+
+      .. versionadded:: 4.0
+
+   :param bool require_response_digest: Require every response to carry a
+      supported ``Content-Digest`` entry (``sha-256``); responses without
+      one fail with :exc:`aiohttp.ContentDigestError` when the body is
+      read. Implies *verify_response_digest* (``False`` by default).
+
+      .. versionadded:: 4.0
 
    :param ssl: Default SSL validation mode for requests made through this
       session. ``True`` for default SSL check
@@ -577,6 +597,18 @@ The client session supports the context manager protocol for self closing.
       :param bool auto_decompress: Automatically decompress response body.
          Overrides :attr:`ClientSession.auto_decompress`.
          May be used to enable/disable auto decompression on a per-request basis.
+
+      :param bool verify_response_digest: Verify the response payload
+         against the ``sha-256`` entry of the :mailheader:`Content-Digest`
+         header. Overrides the session-level ``verify_response_digest``.
+
+         .. versionadded:: 4.0
+
+      :param bool require_response_digest: Fail the response when no
+         supported ``Content-Digest`` entry is provided. Overrides the
+         session-level ``require_response_digest``.
+
+         .. versionadded:: 4.0
 
       :param int max_line_size: Maximum allowed size of lines in responses.
 
@@ -2842,6 +2874,20 @@ Response errors
    .. versionadded:: 2.3
 
 
+.. class:: ContentDigestError
+   :canonical: aiohttp.client_exceptions.ContentDigestError
+
+   The response payload does not match the ``sha-256`` entry of the
+   :mailheader:`Content-Digest` header, the header is malformed, or no
+   supported digest was provided while one was required. Only raised when
+   response digest verification is enabled (see
+   ``verify_response_digest``).
+
+   Derived from :exc:`ClientResponseError`
+
+   .. versionadded:: 4.0
+
+
 .. class:: TooManyRedirects
    :canonical: aiohttp.client_exceptions.TooManyRedirects
 
@@ -3031,6 +3077,8 @@ Hierarchy of exceptions
   * :exc:`ClientResponseError`
 
     * :exc:`~aiohttp.ClientHttpProxyError`
+
+    * :exc:`ContentDigestError`
 
     * :exc:`ContentTypeError`
 

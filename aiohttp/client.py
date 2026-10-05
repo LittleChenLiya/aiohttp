@@ -52,6 +52,7 @@ from .client_exceptions import (
     ClientResponseError,
     ClientSSLError,
     ConnectionTimeoutError,
+    ContentDigestError,
     ContentTypeError,
     InvalidURL,
     InvalidUrlClientError,
@@ -124,6 +125,7 @@ __all__ = (
     "ClientResponseError",
     "ClientSSLError",
     "ConnectionTimeoutError",
+    "ContentDigestError",
     "ContentTypeError",
     "InvalidURL",
     "InvalidUrlClientError",
@@ -190,6 +192,8 @@ class _RequestOptions(TypedDict, total=False):
     trace_request_ctx: object
     read_bufsize: int | None
     auto_decompress: bool | None
+    verify_response_digest: bool | None
+    require_response_digest: bool | None
     max_line_size: int | None
     max_field_size: int | None
     max_headers: int | None
@@ -273,6 +277,8 @@ class ClientSession:
         "_timeout",
         "_raise_for_status",
         "_auto_decompress",
+        "_verify_response_digest",
+        "_require_response_digest",
         "_trust_env",
         "_default_headers",
         "_skip_auto_headers",
@@ -312,6 +318,8 @@ class ClientSession:
         raise_for_status: bool | Callable[[ClientResponse], Awaitable[None]] = False,
         timeout: _SENTINEL | ClientTimeout | None = sentinel,
         auto_decompress: bool = True,
+        verify_response_digest: bool = False,
+        require_response_digest: bool = False,
         trust_env: bool = False,
         requote_redirect_url: bool = True,
         trace_configs: list[TraceConfig[object]] | None = None,
@@ -389,6 +397,8 @@ class ClientSession:
         self._json_serialize_bytes = json_serialize_bytes
         self._raise_for_status = raise_for_status
         self._auto_decompress = auto_decompress
+        self._verify_response_digest = verify_response_digest
+        self._require_response_digest = require_response_digest
         self._trust_env = trust_env
         self._requote_redirect_url = requote_redirect_url
         self._read_bufsize = read_bufsize
@@ -490,6 +500,8 @@ class ClientSession:
         trace_request_ctx: object = None,
         read_bufsize: int | None = None,
         auto_decompress: bool | None = None,
+        verify_response_digest: bool | None = None,
+        require_response_digest: bool | None = None,
         max_line_size: int | None = None,
         max_field_size: int | None = None,
         max_headers: int | None = None,
@@ -578,6 +590,16 @@ class ClientSession:
 
         if auto_decompress is None:
             auto_decompress = self._auto_decompress
+
+        if verify_response_digest is None:
+            verify_response_digest = self._verify_response_digest
+
+        if require_response_digest is None:
+            require_response_digest = self._require_response_digest
+
+        if require_response_digest:
+            # Requiring a digest implies verifying it.
+            verify_response_digest = True
 
         if max_line_size is None:
             max_line_size = self._max_line_size
@@ -677,6 +699,7 @@ class ClientSession:
                         "skip_payload": method in EMPTY_BODY_METHODS,
                         "read_until_eof": read_until_eof,
                         "auto_decompress": auto_decompress,
+                        "verify_response_digest": verify_response_digest,
                         "read_timeout": real_timeout.sock_read,
                         "read_bufsize": read_bufsize,
                         "timeout_ceil_threshold": self._connector._timeout_ceil_threshold,
@@ -752,6 +775,11 @@ class ClientSession:
                         if exc.errno is None and isinstance(exc, asyncio.TimeoutError):
                             raise
                         raise ClientOSError(*exc.args) from exc
+
+                    # Opt-in Content-Digest verification policy for this
+                    # response; the hasher itself is picked up from the
+                    # protocol's parser in ClientResponse.start().
+                    resp._require_response_digest = require_response_digest
 
                     # Update cookies from raw headers to preserve duplicates
                     if resp._raw_cookie_headers:
