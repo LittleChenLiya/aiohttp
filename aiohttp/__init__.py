@@ -88,6 +88,7 @@ from .payload import (
     payload_type,
 )
 from .resolver import AsyncResolver, DefaultResolver, ThreadedResolver
+from .sse import EventSource, ServerSentEvent
 from .streams import EMPTY_PAYLOAD, DataQueue, EofStream, StreamReader
 from .tracing import (
     TraceConfig,
@@ -207,6 +208,9 @@ __all__: tuple[str, ...] = (
     "AsyncResolver",
     "DefaultResolver",
     "ThreadedResolver",
+    # sse
+    "EventSource",
+    "ServerSentEvent",
     # streams
     "DataQueue",
     "EMPTY_PAYLOAD",

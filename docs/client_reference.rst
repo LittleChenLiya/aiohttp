@@ -1982,6 +1982,88 @@ manually.
       :raise TypeError: if message is :const:`~aiohttp.WSMsgType.BINARY`.
       :raise ValueError: if message is not valid JSON.
 
+.. _aiohttp-client-reference-sse:
+
+Server-Sent Events
+------------------
+
+.. versionadded:: 4.0
+
+.. class:: EventSource(response, *, max_line_size=2**20)
+   :canonical: aiohttp.sse.EventSource
+
+   An async iterator over the events of a ``text/event-stream``
+   (`Server-Sent Events
+   <https://html.spec.whatwg.org/multipage/server-sent-events.html>`_)
+   response.
+
+   The source parses a single response body; it does not attempt to
+   reconnect when the stream ends.  Multi-line ``data`` fields are
+   joined with newlines, comment lines are skipped, and buffered events
+   are dispatched on blank lines.
+
+   The class is also an async context manager, which releases the
+   response when iteration stops early::
+
+      async with session.get(url) as resp:
+          async with EventSource(resp) as events:
+              async for event in events:
+                  print(event.data)
+
+   :param ClientResponse response: the response to read events from.
+
+   :param int max_line_size: maximum allowed length of a single stream
+                             line, in characters (``2**20`` by
+                             default); longer lines
+                             raise :exc:`ValueError`.
+
+   .. attribute:: response
+
+      The :class:`ClientResponse` being parsed.
+
+   .. attribute:: last_event_id
+
+      The last event ID seen on the stream so far, ``str``.  An empty
+      ``id`` field resets it, and an ``id`` field containing a NUL
+      character is ignored.
+
+   .. attribute:: retry
+
+      The last valid ``retry`` field seen on the stream, in
+      milliseconds (:class:`int` or ``None``).  Values that are not
+      plain decimal numbers are ignored.
+
+   .. method:: close()
+
+      Stop iterating and release the underlying response.  Fully
+      consumed streams are released back to the connection pool, while
+      streams abandoned mid-way are closed.  Calling it more than once
+      is harmless.
+
+.. class:: ServerSentEvent()
+   :canonical: aiohttp.sse.ServerSentEvent
+
+   A single event dispatched from a ``text/event-stream`` response.
+
+   .. attribute:: data
+
+      The event payload, ``str``.  Multiple ``data`` fields are joined
+      with ``"\n"``.
+
+   .. attribute:: event
+
+      The event type, ``"message"`` unless an ``event`` field was
+      present.
+
+   .. attribute:: id
+
+      The last event ID seen on the stream at dispatch time, ``str``.
+
+   .. attribute:: retry
+
+      The last valid ``retry`` field seen on the stream at dispatch
+      time, in milliseconds (:class:`int` or ``None``).
+
 ClientRequest
 -------------
 

@@ -1,0 +1,5 @@
+Added :class:`aiohttp.EventSource` and :class:`aiohttp.ServerSentEvent` for
+consuming ``text/event-stream`` (Server-Sent Events) responses -- an async
+iterator that joins multi-line ``data`` fields, tracks the ``event``, ``id``
+and ``retry`` fields, skips comment lines, and releases the underlying
+response when iteration finishes, fails, or is cancelled.
