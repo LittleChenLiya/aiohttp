@@ -1,0 +1,7 @@
+Added :class:`aiohttp.EventSource`, an async iterator that parses
+Server-Sent Events (SSE) from a :class:`~aiohttp.ClientResponse` in a
+single pass: multi-line ``data`` fields are merged, ``event``, ``id``
+and all-decimal ``retry`` fields are recognized, comments are skipped,
+and the response is released when iteration ends, is cancelled, or the
+configurable ``max_event_size`` limit is exceeded
+-- by :user:`contributor`.

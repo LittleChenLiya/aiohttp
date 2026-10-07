@@ -1982,7 +1982,102 @@ manually.
       :raise TypeError: if message is :const:`~aiohttp.WSMsgType.BINARY`.
       :raise ValueError: if message is not valid JSON.
 
+EventSource
+-----------
+
+.. class:: EventSource(response, *, max_event_size=1024*1024)
+   :canonical: aiohttp.sse.EventSource
+
+   An async iterator over `Server-Sent Events
+   <https://html.spec.whatwg.org/multipage/server-sent-events.html>`_
+   parsed from a :class:`ClientResponse` body, e.g. a response with
+   the ``text/event-stream`` content type.
+
+   The source performs a single pass over the response; it does *not*
+   reconnect automatically.  The byte stream is decoded as UTF-8, so
+   multi-byte characters split across chunks are reassembled
+   correctly.  ``data`` fields are merged with ``"\n"`` separators,
+   ``event``, ``id`` and all-decimal ``retry`` fields are recognized,
+   comment lines are skipped, an empty line dispatches the buffered
+   event, an empty ``id`` resets the last event ID, an ``id``
+   containing a NUL character is ignored, and a partial trailing line
+   at the end of the stream is discarded.
+
+   The class supports both the async iterator protocol and the async
+   context manager protocol; leaving the ``async with`` block releases
+   the underlying response::
+
+      async with session.get(url) as resp:
+          async with aiohttp.EventSource(resp) as source:
+              async for event in source:
+                  print(event.data)
+
+   .. versionadded:: 4.0
+
+   :param ClientResponse response: response to read events from.
+
+   :param int max_event_size: upper bound for a single event's
+                              buffered data, in characters
+                              (``1024 * 1024`` by default).  An event
+                              that grows past the limit raises
+                              :exc:`SSEBufferOverflowError` and
+                              releases the response.
+
+   .. attribute:: response
+
+      The :class:`ClientResponse` this source is reading from.
+
+   .. attribute:: last_event_id
+
+      The last event ID seen so far, :class:`str` or :data:`None` if
+      no ``id`` field has been received yet.
+
+   .. attribute:: retry
+
+      The last valid ``retry`` field value, :class:`int` or
+      :data:`None` if no valid ``retry`` field has been received yet.
+
+   .. attribute:: closed
+
+      ``True`` if the source has been closed explicitly.
+
+   .. method:: aclose()
+      :async:
+
+      Stop iterating and release the underlying response.
+
+
+.. class:: ServerSentEvent()
+   :canonical: aiohttp.sse.ServerSentEvent
+
+   A single event parsed from a Server-Sent Events stream, as yielded
+   by :class:`EventSource`.
+
+   .. versionadded:: 4.0
+
+   .. attribute:: data
+
+      The event payload: all ``data`` fields of the event merged with
+      ``"\n"`` separators, :class:`str`.
+
+   .. attribute:: event
+
+      The event type given by the ``event`` field, or ``"message"``
+      if absent, :class:`str`.
+
+   .. attribute:: id
+
+      The last event ID at the time the event was dispatched,
+      :class:`str` or :data:`None`.
+
+   .. attribute:: retry
+
+      The last valid ``retry`` field value at the time the event was
+      dispatched, :class:`int` or :data:`None`.
+
+
 ClientRequest
+-------------
 -------------
 
 .. class:: ClientRequest
@@ -2739,6 +2834,26 @@ All exceptions are available as members of *aiohttp* module.
    3. not enough data that satisfy ``Content-Length`` HTTP header.
 
    Derived from :exc:`ClientError`
+
+.. exception:: SSEError
+   :canonical: aiohttp.sse.SSEError
+
+   Base class for Server-Sent Events processing errors raised while
+   iterating an :class:`EventSource`.
+
+   Derived from :exc:`ClientError`
+
+   .. versionadded:: 4.0
+
+.. exception:: SSEBufferOverflowError
+   :canonical: aiohttp.sse.SSEBufferOverflowError
+
+   A single Server-Sent Event grew past the configured
+   ``max_event_size`` buffer limit of an :class:`EventSource`.
+
+   Derived from :exc:`SSEError`
+
+   .. versionadded:: 4.0
 
 .. exception:: InvalidURL
    :canonical: aiohttp.client_exceptions.InvalidURL
